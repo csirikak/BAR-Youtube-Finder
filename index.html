@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BAR Youtube Finder</title>
+    <link rel="icon" type="image/png" href="https://cdn.prod.website-files.com/5c68622246b367adf6f3041d/66db72b254c9b267644377f7_favicon%20(2024).png"/>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+    
+    <link rel="stylesheet" href="frontend_files/style.css">
+    
+    <script src="https://cdn.jsdelivr.net/npm/fuse.js/dist/fuse.min.js"></script>
+    <script src="frontend_files/app.js" defer></script>
+</head>
+<body>
+
+    <div class="container">
+        <h1><img src="https://cdn.prod.website-files.com/5c68622246b367adf6f3041d/66f94bf43835f103fe529d9f_BAR-Beyond-All-Reason-Logo-20-Simple-NoGlow-V2.svg" width="240" alt="" class="logo-img">
+Video Battle Finder</h1>
+        
+        <nav class="tab-nav">
+            <button class="tab-btn active" data-tab="tab-player-search">Search by Player Name</button>
+            <button class="tab-btn" data-tab="tab-ocr-search">Fuzzy Search OCR Data</button>
+        </nav>
+
+        <div id="tab-player-search" class="tab-content search-section active">
+            <h2>Search by Player Name</h2>
+            <p>Finds videos associated with a specific, known battle a player was in. (Exact Match)</p>
+            <input type="text" id="player-search" placeholder="Enter exact player name...">
+            <div id="player-results" class="results"></div>
+        </div>
+
+        <div id="tab-ocr-search" class="tab-content search-section">
+            <h2>Fuzzy Search OCR Data</h2>
+            <p>Finds videos and timestamps by fuzzy-matching any OCR'd player name.</p>
+            <input type="text" id="ocr-search" placeholder="Enter part of an OCR'd name...">
+            <div id="ocr-results" class="results"></div>
+        </div>
+        
+    </div>
+
+    <div id="loading" class="loading-status">Loading Data...</div>
+
+</body>
+</html>

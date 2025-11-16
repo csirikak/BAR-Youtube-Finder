@@ -1,0 +1,178 @@
+:root {
+    --bg-color: #1a1a1a;
+    --text-color: #e0e0e0;
+    --card-bg: #2c2c2c;
+    --border-color: #444;
+    --primary-color: #4a90e2;
+    --font-main: 'Poppins', sans-serif;
+}
+body, html {
+    font-family: var(--font-main);
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    margin: 0;
+    padding: 20px;
+}
+.container {
+    max-width: 1200px; /* Wider container for tabs */
+    margin: 0 auto;
+}
+h1, h2 {
+    font-weight: 600;
+    color: var(--primary-color);
+    border-bottom: 2px solid var(--border-color);
+    padding-bottom: 10px;
+}
+h1 {
+    text-align: left;
+    margin-bottom: 20px;
+}
+
+/* This is now the tab panel itself */
+.search-section {
+    background-color: var(--card-bg);
+    border-radius: 8px;
+    padding: 20px;
+    border: 1px solid var(--border-color);
+}
+input[type="text"] {
+    font-family: var(--font-main);
+    width: calc(100% - 20px);
+    padding: 10px;
+    font-size: 1rem;
+    border: 1px solid var(--border-color);
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    border-radius: 5px;
+    margin-bottom: 15px;
+}
+.results {
+    margin-top: 15px;
+    max-height: 70vh; /* Taller results area */
+    overflow-y: auto;
+    padding-right: 10px;
+}
+
+/* --- TAB STYLES --- */
+.tab-nav {
+    display: flex;
+    border-bottom: 2px solid var(--border-color);
+    margin-bottom: 20px; /* Space between tabs and content */
+}
+.tab-btn {
+    font-family: var(--font-main);
+    font-size: 1rem;
+    font-weight: 600;
+    padding: 10px 20px;
+    cursor: pointer;
+    border: none;
+    background-color: transparent;
+    color: var(--text-color);
+    opacity: 0.7;
+    border-bottom: 3px solid transparent;
+    margin-bottom: -2px; /* Sits on the container border */
+}
+.tab-btn:hover {
+    opacity: 1;
+}
+.tab-btn.active {
+    opacity: 1;
+    border-bottom-color: var(--primary-color);
+}
+.tab-content {
+    display: none; /* Hide all tabs by default */
+}
+.tab-content.active {
+    display: block; /* Show only the active one */
+}
+/* --- END TAB STYLES --- */
+
+
+.loading-status {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    background-color: #333;
+    color: white;
+    padding: 10px 15px;
+    border-radius: 5px;
+    font-weight: 600;
+    display: none;
+    overflow: hidden;
+    z-index: 10;
+    --progress: 0%;
+}
+.loading-status::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: var(--progress);
+    background-color: var(--primary-color);
+    transition: width 0.1s ease-out;
+    z-index: -1;
+}
+
+/* --- TABLE STYLES --- */
+.results-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+}
+.results-table th,
+.results-table td {
+    padding: 10px;
+    border-bottom: 1px solid var(--border-color);
+    text-align: left;
+    vertical-align: middle;
+}
+.results-table th {
+    font-weight: 600;
+    color: var(--primary-color);
+}
+.results-table .col-thumb {
+    width: 100px;
+}
+.results-table .col-thumb img {
+    width: 100%;
+    border-radius: 4px;
+}
+.results-table .col-title strong {
+    font-weight: 600;
+    color: var(--text-color);
+}
+.results-table .col-title p {
+    font-size: 0.8rem;
+    color: #aaa;
+    margin: 4px 0 0 0;
+}
+.results-table .col-links {
+    width: 90px;
+}
+.btn-link {
+    display: block;
+    background-color: var(--primary-color);
+    color: white;
+    padding: 5px 8px;
+    border-radius: 4px;
+    text-decoration: none;
+    font-weight: 600;
+    text-align: center;
+    font-size: 0.8rem;
+    margin-bottom: 5px;
+    transition: background-color 0.2s;
+}
+.btn-link:hover {
+    background-color: #5aa0e6;
+}
+.btn-link:last-child {
+    margin-bottom: 0;
+    background-color: #555;
+}
+.btn-link:last-child:hover {
+    background-color: #777;
+}
+top-block {
+    display: inline-block;
+}
