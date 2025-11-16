@@ -34,6 +34,7 @@ h1 {
     border-radius: 8px;
     padding: 20px;
     border: 1px solid var(--border-color);
+    position: relative; /* Added for autocomplete positioning */
 }
 input[type="text"] {
     font-family: var(--font-main);
@@ -175,4 +176,42 @@ input[type="text"] {
 }
 top-block {
     display: inline-block;
+}
+
+/* --- AUTOCOMPLETE STYLES --- */
+.autocomplete-dropdown {
+    display: none; /* Hidden by default */
+    position: absolute;
+    background-color: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-top: none;
+    border-radius: 0 0 5px 5px;
+    z-index: 100;
+    width: calc(100% - 42px); /* Match the input field (100% - 40px padding - 2px border) */
+    left: 20px; /* Align with padding */
+    max-height: 300px;
+    overflow-y: auto;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+}
+.autocomplete-item {
+    padding: 10px;
+    cursor: pointer;
+    color: var(--text-color);
+    font-size: 0.9rem;
+    border-bottom: 1px solid var(--border-color);
+}
+.autocomplete-item:last-child {
+    border-bottom: none;
+}
+.autocomplete-item:hover,
+.autocomplete-item.active {
+    background-color: var(--primary-color);
+    color: white;
+}
+.autocomplete-item strong {
+    color: var(--primary-color);
+}
+.autocomplete-item:hover strong,
+.autocomplete-item.active strong {
+    color: white;
 }

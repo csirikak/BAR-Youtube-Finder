@@ -23,12 +23,14 @@ Video Battle Finder</h1>
         <nav class="tab-nav">
             <button class="tab-btn active" data-tab="tab-player-search">Search by Player Name</button>
             <button class="tab-btn" data-tab="tab-ocr-search">Fuzzy Search OCR Data</button>
+            <button class="tab-btn" data-tab="tab-map-search">Browse by Map</button>
         </nav>
 
         <div id="tab-player-search" class="tab-content search-section active">
             <h2>Search by Player Name</h2>
             <p>Finds videos associated with a specific, known battle a player was in. (Exact Match)</p>
             <input type="text" id="player-search" placeholder="Enter exact player name...">
+            <div id="player-autocomplete" class="autocomplete-dropdown"></div>
             <div id="player-results" class="results"></div>
         </div>
 
@@ -37,6 +39,14 @@ Video Battle Finder</h1>
             <p>Finds videos and timestamps by fuzzy-matching any OCR'd player name.</p>
             <input type="text" id="ocr-search" placeholder="Enter part of an OCR'd name...">
             <div id="ocr-results" class="results"></div>
+        </div>
+        
+        <div id="tab-map-search" class="tab-content search-section">
+            <h2>Browse by Map</h2>
+            <p>Finds videos of battles played on a specific map.</p>
+            <input type="text" id="map-search" placeholder="Enter map name...">
+            <div id="map-autocomplete" class="autocomplete-dropdown"></div>
+            <div id="map-results" class="results"></div>
         </div>
         
     </div>

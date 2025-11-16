@@ -1,7 +1,7 @@
 import yt_dlp
 import subprocess
 import os
-import sys
+import threading
 from yt_dlp.utils import DateRange
 import curl_cffi
 from yt_dlp.networking import impersonate
@@ -13,7 +13,7 @@ import re
 
 # --- CONFIGURATION ---
 # Max number of videos to download/process in parallel
-MAX_WORKERS = 20 
+MAX_WORKERS = 30 
 # Time of the first screenshot in seconds
 START_TIME_SEC = 90  # 1:30
 # Interval between screenshots in seconds
@@ -24,6 +24,7 @@ SCREENSHOT_DIR = "data/AllBarScreenshots"
 FETCH_FROM = "20240601"
 
 SCREENSHOT_DATA = "data/screenshot_data.json"
+DB_LOCK = threading.Lock()
 
 def populateHaveSet():
     file_names = set()
@@ -67,61 +68,83 @@ def update_video_database(video_list, db_filepath='screenshot_data.json'):
     video_db = {}
     
     # 1. Try to load the existing database
-    try:
-        with open(db_filepath, 'r', encoding='utf-8') as f:
-            video_db = json.load(f)
-        # Ensure it's a dictionary
-        if not isinstance(video_db, dict):
-            print(f"Warning: '{db_filepath}' was not a valid dictionary. Starting fresh.")
+    with DB_LOCK:
+        try:
+            with open(db_filepath, 'r', encoding='utf-8') as f:
+                video_db = json.load(f)
+            # Ensure it's a dictionary
+            if not isinstance(video_db, dict):
+                print(f"Warning: '{db_filepath}' was not a valid dictionary. Starting fresh.")
+                video_db = {}
+        except (FileNotFoundError, json.JSONDecodeError):
+            print(f"No existing database found at '{db_filepath}'. Creating a new one.")
             video_db = {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        print(f"No existing database found at '{db_filepath}'. Creating a new one.")
-        video_db = {}
-    except Exception as e:
-        print(f"Error reading database file: {e}. Starting with an empty DB.")
-        video_db = {}
+        except Exception as e:
+            print(f"Error reading database file: {e}. Starting with an empty DB.")
+            video_db = {}
 
-    updates_count = 0
-    additions_count = 0
+        updates_count = 0
+        additions_count = 0
 
-    # 2. Iterate through fetched videos and update the db
-    for video in video_list:
-        if not video or not video.get('id'):
-            continue  # Skip invalid entries
+        # 2. Iterate through fetched videos and update the db
+        for video in video_list:
+            if not video or not video.get('id'):
+                continue  # Skip invalid entries
+            
+            video_id = video.get('id')
+
+            # Create the data payload with requested fields
+            video_data = {
+                'title': video.get('title'),
+                'upload_date': video.get('upload_date'), # 'creation data'
+                'duration': video.get('duration'),
+                'uploader': video.get('uploader'),
+                'tags': video.get('tags'),
+                'thumbnail': video.get('thumbnail')
+            }
+
+            # Check if it's an addition or update
+            if video_id in video_db:
+                updates_count += 1
+            else:
+                additions_count += 1
+            
+            # Add or update the entry
+            video_db[video_id] = video_data
+
+        # 3. Write the updated database back to the file
+        try:
+            with open(db_filepath, 'w', encoding='utf-8') as f:
+                # Use indent=4 for readability, ensure_ascii=False for special chars
+                json.dump(video_db, f, indent=4, ensure_ascii=False)
+        except IOError as e:
+            print(f"\n[ERROR] Could not write database to '{db_filepath}': {e}")
+            # Return 0,0 if save fails
+            return (0, 0)
         
-        video_id = video.get('id')
+        # 4. Return the result
+        return (additions_count, updates_count)
 
-        # Create the data payload with requested fields
-        video_data = {
-            'title': video.get('title'),
-            'upload_date': video.get('upload_date'), # 'creation data'
-            'duration': video.get('duration'),
-            'uploader': video.get('uploader'),
-            'tags': video.get('tags'),
-            'thumbnail': video.get('thumbnail')
-        }
-
-        # Check if it's an addition or update
-        if video_id in video_db:
-            updates_count += 1
-        else:
-            additions_count += 1
-        
-        # Add or update the entry
-        video_db[video_id] = video_data
-
-    # 3. Write the updated database back to the file
+def fetch_and_process_video(ydl_instance, video_url, output_dir, game_tag):
+    """
+    Helper function for Stage 2.
+    Fetches full metadata for a single video URL and then
+    passes that metadata to the screenshot processing function.
+    """
     try:
-        with open(db_filepath, 'w', encoding='utf-8') as f:
-            # Use indent=4 for readability, ensure_ascii=False for special chars
-            json.dump(video_db, f, indent=4, ensure_ascii=False)
-    except IOError as e:
-        print(f"\n[ERROR] Could not write database to '{db_filepath}': {e}")
-        # Return 0,0 if save fails
-        return (0, 0)
-    
-    # 4. Return the result
-    return (additions_count, updates_count)
+        # This is the network call to get stream URLs
+        
+        
+        # Now we have the full info, update the database
+        
+        
+        # And process the screenshots
+        return process_video_screenshots(full_video_info, output_dir, game_tag)
+        
+    except Exception as e:
+        # This error is for the *individual* video fetch
+        print(f"[WARN] Failed to fetch full metadata for {video_url}: {e}")
+        return None, f"Skipped (Failed full fetch: {e})", 0
 
 def process_video_screenshots(video, output_dir, game_tag=""):
     """
@@ -205,13 +228,6 @@ def process_video_screenshots(video, output_dir, game_tag=""):
         if header_string:
             ffmpeg_command.extend(['-headers', header_string])
 
-        # --- --- --- --- --- --- --- --- --- --- --- --- ---
-        # *** THE FIX IS HERE ***
-        # By placing -i (input) *before* -ss (seek), we use "output seeking".
-        # This is more reliable for complex streams (like live/DVR)
-        # than "input seeking" (-ss before -i).
-        #
-        # OLD (Failing) ORDER:
         ffmpeg_command.extend([
             '-hwaccel', 'vaapi',                 # 1. Force VAAPI
             '-hwaccel_device', '/dev/dri/renderD128', # 2. Select the AMD GPU
@@ -222,19 +238,6 @@ def process_video_screenshots(video, output_dir, game_tag=""):
             '-y', 
             output_filename
         ])
-        #
-        # NEW (Reliable) ORDER:
-        '''
-        ffmpeg_command.extend([
-            '-i', stream_url,
-            '-ss', str(timestamp_sec), # Seek to the correct timestamp
-            '-vframes', '1',
-            '-y', 
-            output_filename
-        ])
-        '''
-        # --- --- --- --- --- --- --- --- --- --- --- --- ---
-
         try:
             subprocess.run(
                 ffmpeg_command,
@@ -254,87 +257,154 @@ def process_video_screenshots(video, output_dir, game_tag=""):
 
 def get_channel_screenshots(channel_url, output_dir, game_tag=""):
     """
-    Downloads screenshots from all videos in a channel.
-    - Fetches all video info in a single pass.
-    - Uses a ThreadPoolExecutor to process videos in parallel.
+    Downloads screenshots from all videos in a channel using a 
+    two-stage, library-only method to avoid rate-limiting.
     """
     
     os.makedirs(output_dir, exist_ok=True)
     print(f"Saving screenshots to: {os.path.abspath(output_dir)}")
-    ydl_opts = {
-        'format': 'bestvideo*+bestaudio/best',
+
+    # --- STAGE 1: Fast "flat" fetch ---
+    # We fetch *only* the playlist structure, not the
+    # deep metadata for every single video. This is fast
+    # and avoids rate-limiting.
+    
+    print(f"Stage 1: Fetching flat video list for channel: {channel_url}...")
+    
+    # 'extract_flat': 'in_playlist' is the key.
+    # It returns a list of video entries immediately.
+    flat_opts = {
+        'extract_flat': 'in_playlist',
+        'daterange': DateRange(start=FETCH_FROM),
+        'download_archive': '/tmp/haveScreenshots.txt',
         'impersonate': impersonate.ImpersonateTarget("safari", "26.0"),
         'extractor_args': {"youtube":{"player_client": ["tv_simply"]}},
-        #'sleep_interval_requests': 5,
-        'quiet': False,
-        'ignoreerrors': True, 
         'js_runtimes': {'node':{}},
-        #'cookiefile': "cookies-youtube-com.txt",
-        'daterange': DateRange(start=FETCH_FROM),
-        'verbose': True,
-        'download_archive': '/tmp/haveScreenshots.txt',
-        'break_on_reject': True,
-
+        'quiet': False,
+        'ignoreerrors': True,
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            print(f"Fetching video list for channel: {channel_url}...")
-            print(f"Filtering for tag: '{game_tag}' and videos since 2024-06-01.")
-            ydl.extract_info
+        with yt_dlp.YoutubeDL(flat_opts) as ydl:
+            # This call is now very fast and returns a flat list
+            # of all videos that passed the daterange/archive filters.
             channel_info = ydl.extract_info(channel_url, download=False)
-            '''
-            if 'entries' not in channel_info or not channel_info['entries']:
-                print("No videos found matching your date criteria.")
-                return
-            '''
-            videos = list(flatten_entries(channel_info['entries']))
-            if not videos:
-                print("No video entries found after flattening playlists.")
-                return
-            
-            additions, updates = update_video_database(videos, SCREENSHOT_DATA)
-            print(f"Database: {additions} new videos added, {updates} existing videos updated.")
-            print(f"Found {len(videos)} videos (post-date-filter). Submitting to processing pool...")
-
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                future_to_video = {}
-                for video in videos:
-                    if video:
-                        future = executor.submit(process_video_screenshots, video, output_dir, game_tag)
-                        future_to_video[future] = video.get('id', 'unknown')
-
-                print(f"Submitted {len(future_to_video)} videos to {MAX_WORKERS} workers.")
-                
-                for future in as_completed(future_to_video):
-                    video_id_from_future = future_to_video[future]
-                    try:
-                        vid_id, message, count = future.result()
-                        if count > 0:
-                            print(f"+++ SUCCESS (ID: {vid_id}): Grabbed {count} new screenshot(s) from '{message.replace('Processed ', '')}'")
-                        
-                        elif "Skipped" in message:
-                            print(f"--- INFO (ID: {vid_id}): {message}")
-                            
-                    except Exception as e:
-                        # Print the exception to see what went wrong in the thread
-                        print(f"[ERROR] Thread for video ID {video_id_from_future} failed: {e}")
-
+    
     except yt_dlp.utils.DownloadError as e:
-        print(f"\n[ERROR] A yt-dlp error occurred: {e}")
+        print(f"\n[ERROR] A yt-dlp error occurred during flat fetch: {e}")
+        return
     except Exception as e:
         print(f"\n[ERROR] An unexpected error occurred: {e}")
+        return
 
+    if not channel_info or 'entries' not in channel_info or not channel_info['entries']:
+        print("No new videos found matching your criteria.")
+        return
+
+    # The videos are already flat, so we just grab the list
+    videos_to_process = channel_info['entries']
+    
+    # We didn't use 'break_on_reject', so we have all videos
+    # since FETCH_FROM. We can't stop early, but this single
+    # flat fetch is far less taxing than your original method.
+    print(f"Stage 1 Complete: Found {len(videos_to_process)} new videos.")
+
+    # --- STAGE 2: Fetch Full Metadata & Process in Parallel ---
+    # Now we loop through our filtered list and fetch the *full*
+    # metadata (with stream URLs) only for these few videos.
+    
+    print("Stage 2: Submitting videos to processing pool...")
+    
+    # These are the options needed to get stream URLs
+    full_fetch_opts = {
+        'format': 'bestvideo*+bestaudio/best',
+        'impersonate': impersonate.ImpersonateTarget("safari", "26.0"),
+        'extractor_args': {"youtube":{"player_client": ["tv_simply"]}},
+        'js_runtimes': {'node':{}},
+        'quiet': False,
+    }
+    print("Stage 2: Fetching full metadata for new videos sequentially...")
+    full_videos_to_process = []
+    
+    # Use a single ydl instance to fetch metadata sequentially
+    try:
+        with yt_dlp.YoutubeDL(full_fetch_opts) as ydl:
+            for i, video_stub in enumerate(videos_to_process, 1):
+                if not video_stub or not video_stub.get('url'):
+                    print(f"[WARN] Skipping video stub {i}/{len(videos_to_process)} (no URL).")
+                    continue
+                
+                print(f"Fetching metadata for video {i}/{len(videos_to_process)}: {video_stub.get('id')}")
+                try:
+                    # 1. FETCH SEQUENTIALLY
+                    full_video_info = ydl.extract_info(video_stub['url'], download=False)
+                    
+                    if not full_video_info:
+                        print(f"[WARN] Failed to fetch full info for {video_stub.get('id')}.")
+                        continue
+                        
+                    # 2. UPDATE DATABASE SEQUENTIALLY
+                    update_video_database([full_video_info], SCREENSHOT_DATA)
+                    
+                    # 3. ADD TO LIST FOR PARALLEL PROCESSING
+                    full_videos_to_process.append(full_video_info)
+                    
+                except yt_dlp.utils.DownloadError as e:
+                    print(f"[WARN] Failed to fetch {video_stub.get('id')}: {e}. Video may be private/deleted.")
+                except Exception as e:
+                    print(f"[ERROR] Unexpected error fetching {video_stub.get('id')}: {e}")
+
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize YoutubeDL for Stage 2: {e}")
+        return
+
+    print(f"\nMetadata fetch complete. Found {len(full_videos_to_process)} processable videos.")
+    print("Submitting screenshot processing to parallel thread pool...")
+
+    # Now, process the screenshots in parallel using the full info we just gathered
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_video_id = {}
+        
+        for video_info in full_videos_to_process:
+            future = executor.submit(
+                process_video_screenshots, 
+                video_info, 
+                output_dir, 
+                game_tag
+            )
+            future_to_video_id[future] = video_info.get('id', 'unknown')
+
+        print(f"Submitted {len(future_to_video_id)} videos to {MAX_WORKERS} workers.")
+        
+        for future in as_completed(future_to_video_id):
+            video_id_from_future = future_to_video_id[future]
+            try:
+                # This will be (vid_id, message, count)
+                result = future.result()
+                if not result:
+                    continue
+                    
+                vid_id, message, count = result
+                
+                if count > 0:
+                    print(f"+++ SUCCESS (ID: {vid_id}): Grabbed {count} new screenshot(s) from '{message.replace('Processed ', '')}'")
+                elif "Skipped" in message:
+                    pass # print(f"--- INFO (ID: {vid_id}): {message}")
+                    
+            except Exception as e:
+                print(f"[ERROR] Thread for video ID {video_id_from_future} failed: {e}")
 # --- --- --- --- ---
 #      RUN SCRIPT
 # --- --- --- --- ---
 if __name__ == "__main__":
     channels = [
+        "https://www.youtube.com/@BetterStrategy/videos",
+        "https://www.youtube.com/@JAWSMUNCH304/videos",
         "https://www.youtube.com/@simplygraceful1/videos",
         "https://www.youtube.com/@dskinnerify/videos",
         "https://www.youtube.com/@BrightWorksTV/videos",
         "https://www.youtube.com/@MoreDrongo/videos",
-        "https://www.youtube.com/@SuperKitowiec2/videos"
+        "https://www.youtube.com/@SuperKitowiec2/videos",
     ]
     for channel in channels:
         get_channel_screenshots(

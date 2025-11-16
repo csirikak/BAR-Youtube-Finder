@@ -126,6 +126,9 @@ def find_best_match(ocr_player_list, video_upload_date_str, inverted_index, batt
         for battle_id in matched_battles:
             # Add 1 to this battle's "candidate score"
             candidate_scores[battle_id] += 1
+        # Skip AI games
+        if "(AI)" in ocr_name or "(Al)" in ocr_name:
+            return None, 0 
 
     if not candidate_scores:
         # No player was recognized in the index
@@ -345,6 +348,8 @@ def main():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     try:
+        print("Wiping 'battle_videos' table for a clean insert...")
+        cursor.execute("DELETE FROM battle_videos")
         # Insert all videos
         cursor.executemany('''
         INSERT OR REPLACE INTO videos (video_id, upload_date, title, uploader)

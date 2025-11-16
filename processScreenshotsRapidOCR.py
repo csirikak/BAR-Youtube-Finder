@@ -298,7 +298,7 @@ def init_pool(initialData, lock):
         try:
             print(f"Loading YOLO model from {MODEL_PATH} in process {os.getpid()}...")
             yolo_model = YOLO(MODEL_PATH)
-            yolo_model.to(torch.device(0))
+            yolo_model.to('cuda')
             print(f"YOLO model loaded in process {os.getpid()}.")
         except Exception as e:
             print(f"Warning: Failed to load YOLO model '{MODEL_PATH}' in process {os.getpid()}: {e}")

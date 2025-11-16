@@ -24,10 +24,21 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Global Data Stores ---
     let allData = {};
     let ocrSearcher = null; // This will be our Fuse.js instance
+    let playerSearcher = null; // For player name autocomplete
+    let mapSearcher = null; // For map name autocomplete
     
     // --- Result Area Elements ---
     const playerResultsEl = document.getElementById('player-results');
+    const playerAutocompleteEl = document.getElementById('player-autocomplete');
+    const playerSearchInput = document.getElementById('player-search');
+    
     const ocrResultsEl = document.getElementById('ocr-results');
+    const ocrSearchInput = document.getElementById('ocr-search');
+    
+    const mapResultsEl = document.getElementById('map-results');
+    const mapAutocompleteEl = document.getElementById('map-autocomplete');
+    const mapSearchInput = document.getElementById('map-search');
+    
     const loadingEl = document.getElementById('loading');
 
     // --- Main Data Loading Function ---
@@ -86,20 +97,82 @@ document.addEventListener('DOMContentLoaded', () => {
                 allData = JSON.parse(jsonString);
             }
 
-            // 7. Initialize Fuse.js for OCR search (as before)
+            // 7. Initialize Fuse.js instances
             loadingEl.innerText = 'Indexing data...';
-            const options = {
+            
+            // OCR Searcher (existing)
+            const ocrOptions = {
                 keys: ['ocr_name'],
                 includeScore: true,
                 threshold: 0.4,
             };
-            ocrSearcher = new Fuse(allData.ocr_index, options);
+            ocrSearcher = new Fuse(allData.ocr_index, ocrOptions);
+            
+            // Player Autocomplete Searcher (New)
+            const playerOptions = {
+                includeScore: true,
+                threshold: 0.3, // A bit stricter for autocomplete
+            };
+            playerSearcher = new Fuse(allData.all_player_names, playerOptions);
+
+            // Map Autocomplete Searcher (New)
+            const mapOptions = {
+                includeScore: true,
+                threshold: 0.3,
+            };
+            mapSearcher = new Fuse(allData.all_map_names, mapOptions);
             
             loadingEl.innerText = 'Data Loaded!';
             console.log('Data loaded and indexed.', allData);
+
+            // --- (FIX) ATTACH EVENT LISTENERS ---
+            // Now that searchers are initialized, attach listeners.
+
+            // OCR Search
+            ocrSearchInput.addEventListener('input', (e) => {
+                OCRsearchPlayer(e.target.value);
+            });
+            
+            // Player Search (default options: minChars: 2, showOnFocus: false)
+            setupAutocomplete(
+                playerSearchInput,
+                playerAutocompleteEl,
+                playerSearcher,
+                (selectedValue) => {
+                    searchPlayer(selectedValue); // This is the onSelect callback
+                }
+            );
+            
+            // Map Search (NEW: custom options)
+            setupAutocomplete(
+                mapSearchInput,
+                mapAutocompleteEl,
+                mapSearcher,
+                (selectedValue) => {
+                    searchMap(selectedValue); // This is the onSelect callback
+                },
+                {
+                    minChars: 0,
+                    showOnFocus: true,
+                    allItems: allData.all_map_names
+                }
+            );
+            // --- END EVENT LISTENERS ---
+
+            // Restore last searches
             if (localStorage.getItem('lastPlayerQuery') && playerResultsEl) {
+                playerSearchInput.value = localStorage.getItem('lastPlayerQuery');
                 searchPlayer(localStorage.getItem('lastPlayerQuery'));
             };
+            if (localStorage.getItem('lastMapQuery') && mapResultsEl) {
+                mapSearchInput.value = localStorage.getItem('lastMapQuery');
+                searchMap(localStorage.getItem('lastMapQuery'));
+            };
+            if (localStorage.getItem('lastPlayerOCRQuery')) {
+                ocrSearchInput.value = localStorage.getItem('lastPlayerOCRQuery');
+                OCRsearchPlayer(localStorage.getItem('lastPlayerOCRQuery'));
+            }
+            
         } catch (error) {
             loadingEl.innerText = 'Error Loading Data!';
             loadingEl.style.backgroundColor = 'red';
@@ -115,6 +188,146 @@ document.addEventListener('DOMContentLoaded', () => {
         const min = Math.floor(seconds / 60);
         const sec = seconds % 60;
         return `${min}:${sec.toString().padStart(2, '0')}`;
+    }
+
+    // --- Autocomplete Helper Function (MODIFIED) ---
+    function setupAutocomplete(inputEl, dropdownEl, searcher, onSelect, options = {}) {
+        // --- NEW: Default options ---
+        const { minChars = 2, showOnFocus = false, allItems = [] } = options;
+        let activeIndex = -1;
+
+        // --- Renders fuzzy search results from Fuse.js ---
+        function showResults(query) {
+            if (!searcher) return; 
+            
+            const results = searcher.search(query, { limit: 10 });
+            dropdownEl.innerHTML = '';
+            
+            if (results.length === 0) {
+                dropdownEl.style.display = 'none';
+                return;
+            }
+
+            results.forEach((result, index) => {
+                const item = document.createElement('div');
+                item.classList.add('autocomplete-item');
+                item.innerText = result.item; // result.item is the string
+                item.dataset.index = index;
+                
+                item.addEventListener('click', () => {
+                    inputEl.value = result.item;
+                    onSelect(result.item);
+                    dropdownEl.style.display = 'none';
+                });
+                
+                dropdownEl.appendChild(item);
+            });
+            
+            dropdownEl.style.display = 'block';
+            activeIndex = -1;
+        }
+
+        // --- NEW: Renders a slice of all items (for focus/empty) ---
+        function showAllResults() {
+            if (allItems.length === 0) return;
+
+            dropdownEl.innerHTML = '';
+            const resultsToShow = allItems.slice(0, 100); // Limit to 100
+            
+            if (resultsToShow.length === 0) {
+                dropdownEl.style.display = 'none';
+                return;
+            }
+
+            resultsToShow.forEach((itemText, index) => {
+                const item = document.createElement('div');
+                item.classList.add('autocomplete-item');
+                item.innerText = itemText; // itemText is the string
+                item.dataset.index = index;
+                
+                item.addEventListener('click', () => {
+                    inputEl.value = itemText;
+                    onSelect(itemText);
+                    dropdownEl.style.display = 'none';
+                });
+                
+                dropdownEl.appendChild(item);
+            });
+            
+            dropdownEl.style.display = 'block';
+            activeIndex = -1;
+        }
+        
+        // --- MODIFIED: Input listener ---
+        inputEl.addEventListener('input', (e) => {
+            const query = e.target.value;
+
+            // Standard behavior: if query is less than minChars, hide
+            if (query.length < minChars) {
+                dropdownEl.style.display = 'none';
+                return;
+            }
+
+            // Custom behavior: if empty (and minChars is 0), show all
+            if (query.length === 0 && minChars === 0 && showOnFocus) {
+                showAllResults();
+            } else {
+                // Standard behavior: show fuzzy search
+                showResults(query);
+            }
+        });
+
+        // --- NEW: Focus listener ---
+        if (showOnFocus) {
+            inputEl.addEventListener('focus', () => {
+                const query = inputEl.value;
+                if (query.length === 0) {
+                    showAllResults(); // Show all on focus if empty
+                } else if (query.length >= minChars) {
+                    showResults(query); // Re-show results if focusing back
+                }
+            });
+        }
+
+        // --- UNCHANGED: Keydown listener ---
+        inputEl.addEventListener('keydown', (e) => {
+            const items = dropdownEl.querySelectorAll('.autocomplete-item');
+            if (items.length === 0) return;
+
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                activeIndex = (activeIndex + 1) % items.length;
+                updateActive(items);
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                activeIndex = (activeIndex - 1 + items.length) % items.length;
+                updateActive(items);
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                if (activeIndex > -1) {
+                    items[activeIndex].click();
+                } else {
+                    onSelect(inputEl.value);
+                    dropdownEl.style.display = 'none';
+                }
+            } else if (e.key === 'Escape') {
+                dropdownEl.style.display = 'none';
+            }
+        });
+
+        function updateActive(items) {
+            items.forEach(item => item.classList.remove('active'));
+            if (activeIndex > -1) {
+                items[activeIndex].classList.add('active');
+            }
+        }
+        
+        // --- UNCHANGED: Click-away listener ---
+        document.addEventListener('click', (e) => {
+            if (!dropdownEl.contains(e.target) && e.target !== inputEl) {
+                dropdownEl.style.display = 'none';
+            }
+        });
     }
 
     // --- Search 1: Player Search (Exact) ---
@@ -137,9 +350,6 @@ document.addEventListener('DOMContentLoaded', () => {
             const matches = allData.battle_matches[battle_id] || [];
             
             for (const match of matches) {
-                // 'match' now contains: video_id, timestamp, title, upload_date
-                // This loop runs once per (battle, video) pair
-                
                 const ytLink = `https://www.youtube.com/watch?v=${match.video_id}`;
                 const replayLink = `https://www.beyondallreason.info/replays?gameId=${battle_id}`;
                 const thumbUrl = `https://i.ytimg.com/vi/${match.video_id}/mqdefault.jpg`;
@@ -171,7 +381,6 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        // Wrap rows in table structure
         const tableHtml = `
             <table class="results-table">
                 <thead>
@@ -196,6 +405,7 @@ document.addEventListener('DOMContentLoaded', () => {
         localStorage.setItem('lastPlayerOCRQuery', query);
         
         if (!query || !ocrSearcher) {
+            if(!ocrSearcher) console.error("OCR Searcher not initialized!");
             return;
         }
         
@@ -244,12 +454,69 @@ document.addEventListener('DOMContentLoaded', () => {
         `;
         ocrResultsEl.innerHTML = tableHtml;
     };
-    document.getElementById('ocr-search').addEventListener('input', (e) => {
-        OCRsearchPlayer(e.target.value);
-    });
-    document.getElementById('player-search').addEventListener('input', (e) => {
-        searchPlayer(e.target.value);
-    });
+    
+    // --- Search 3: Map Search ---
+    function searchMap(query) {
+        mapResultsEl.innerHTML = '';
+        localStorage.setItem('lastMapQuery', query);
+        
+        if (!query || !allData.map_index) {
+            return;
+        }
+        
+        const matches = allData.map_index[query] || [];
+        
+        if (matches.length === 0) {
+            mapResultsEl.innerHTML = '<p>No videos found for this map.</p>';
+            return;
+        }
+        
+        let tableRows = [];
+        for (const match of matches) {
+            const ytLink = `https://www.youtube.com/watch?v=${match.video_id}`;
+            const replayLink = `https://www.beyondallreason.info/replays?gameId=${match.battle_id}`;
+            const thumbUrl = `https://i.ytimg.com/vi/${match.video_id}/mqdefault.jpg`;
+            const formattedISOString = match.upload_date.slice(0, 4) + '-' + match.upload_date.slice(4, 6) + '-' + match.upload_date.slice(6, 8);
+            var date = 'N/A';
+            if (match.upload_date != `N/A`) {
+                date = (new Date(formattedISOString)).toDateString();  
+            }
+            
+            tableRows.push(`
+                <tr>
+                    <td class="col-thumb"><a href="${ytLink}" target="_blank"><img src="${thumbUrl}" alt="Thumbnail"></a></td>
+                    <td class="col-title">
+                        <a href="${ytLink}" target="_blank"><strong>${match.title}</strong></a>
+                        <p>Found at: ${formatTimestamp(match.timestamp)}</p>
+                        <p>Uploader: ${match.uploader}</p>
+                    </td>
+                    <td class="col-date">${date}</td>
+                    <td class="col-links">
+                        <a href="${replayLink}" target="_blank" class="btn-link">Replay</a>
+                        <a href="${ytLink}&t=${match.timestamp}s" target="_blank" class="btn-link">Video</a>
+                    </td>
+                </tr>
+            `);
+        }
+
+        const tableHtml = `
+            <table class="results-table">
+                <thead>
+                    <tr>
+                        <th>Thumbnail</th>
+                        <th>Video</th>
+                        <th>Upload Date</th>
+                        <th>Links</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${tableRows.join('')}
+                </tbody>
+            </table>
+        `;
+        mapResultsEl.innerHTML = tableHtml;
+    };
+    
     // --- Start the app ---
     loadData();
 });

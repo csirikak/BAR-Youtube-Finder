@@ -75,11 +75,52 @@ def export_data():
             "upload_date": upload_date or "N/A",
             "uploader": uploader or "N/A"
         })
+
+    # 3. Build Map Index
+    print("Building map index (map_name -> video_matches)...")
+    map_index = defaultdict(list)
+    
+    # This query joins battles (for map_name) with battle_videos and videos
+    # It finds all videos that contain a battle on a specific map.
+    map_query = """
+        SELECT
+            b.map_name,
+            bv.video_id,
+            MIN(bv.video_timestamp_sec) as timestamp,
+            v.title,
+            v.upload_date,
+            v.uploader,
+            bv.battle_id
+        FROM battles b
+        JOIN battle_videos bv ON b.battle_id = bv.battle_id
+        JOIN videos v ON bv.video_id = v.video_id
+        WHERE
+            b.map_name IS NOT NULL
+        GROUP BY b.map_name, bv.video_id, bv.battle_id
+        ORDER BY b.map_name, v.upload_date DESC
+    """
+    cursor.execute(map_query)
+    
+    unique_map_names = set()
+    
+    for row in cursor.fetchall():
+        map_name, video_id, timestamp, title, upload_date, uploader, battle_id = row
+        
+        unique_map_names.add(map_name)
+        
+        map_index[map_name].append({
+            "video_id": video_id,
+            "timestamp": timestamp,
+            "title": title or "Unknown Title",
+            "upload_date": upload_date or "N/A",
+            "uploader": uploader or "N/A",
+            "battle_id": battle_id
+        })
         
     conn.close()
     print("Database processing complete.")
 
-    # 3. Build OCR Search Index
+    # 4. Build OCR Search Index
     print(f"Loading {MATCHES_JSON} to build OCR index...")
     ocr_index = []
     last_battle = 0
@@ -109,13 +150,19 @@ def export_data():
     except Exception as e:
         print(f"Error processing {MATCHES_JSON}: {e}")
 
-    # 4. Compile and save all data
+    # 5. Compile and save all data
     print(f"Saving compiled data to {FRONTEND_DATA_OUTPUT}...")
     
+    all_player_names = list(player_index.keys())
+    all_map_names = sorted(list(unique_map_names))
+    
     frontend_data = {
-        "player_index": player_index,       # For Search 1
-        "battle_matches": battle_matches,   # For Search 1
+        "player_index": player_index,       # For Search 1 (data)
+        "all_player_names": all_player_names, # For Search 1 (autocomplete)
+        "battle_matches": battle_matches,   # For Search 1 (data)
         "ocr_index": ocr_index,             # For Search 2
+        "map_index": map_index,             # For Search 3 (data)
+        "all_map_names": all_map_names,     # For Search 3 (autocomplete)
         "last_battle": last_battle
     }
     
@@ -126,6 +173,7 @@ def export_data():
     print(f"Total players indexed: {len(player_index)}")
     print(f"Total battles with video matches: {len(battle_matches)}")
     print(f"Total OCR names indexed: {len(ocr_index)}")
+    print(f"Total unique maps indexed: {len(all_map_names)}")
 
 if __name__ == "__main__":
     export_data()
