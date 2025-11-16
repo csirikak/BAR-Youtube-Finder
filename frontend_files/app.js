@@ -97,7 +97,9 @@ document.addEventListener('DOMContentLoaded', () => {
             
             loadingEl.innerText = 'Data Loaded!';
             console.log('Data loaded and indexed.', allData);
-
+            if (localStorage.getItem('lastPlayerQuery') && playerResultsEl) {
+                searchPlayer(localStorage.getItem('lastPlayerQuery'));
+            };
         } catch (error) {
             loadingEl.innerText = 'Error Loading Data!';
             loadingEl.style.backgroundColor = 'red';
@@ -116,10 +118,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --- Search 1: Player Search (Exact) ---
-    document.getElementById('player-search').addEventListener('input', (e) => {
-        const query = e.target.value;
+    function searchPlayer(query) {
         playerResultsEl.innerHTML = ''; // Clear previous results
-        
+        localStorage.setItem('lastPlayerQuery', query);
         if (!query || !allData.player_index) {
             return;
         }
@@ -187,12 +188,12 @@ document.addEventListener('DOMContentLoaded', () => {
             </table>
         `;
         playerResultsEl.innerHTML = tableHtml;
-    });
+    };
     
     // --- Search 2: OCR Search (Fuzzy) ---
-    document.getElementById('ocr-search').addEventListener('input', (e) => {
-        const query = e.target.value;
+    function OCRsearchPlayer(query) {
         ocrResultsEl.innerHTML = ''; // Clear previous results
+        localStorage.setItem('lastPlayerOCRQuery', query);
         
         if (!query || !ocrSearcher) {
             return;
@@ -212,13 +213,13 @@ document.addEventListener('DOMContentLoaded', () => {
             
             return `
                 <tr>
-                    <td class="col-thumb"><img src="${thumbUrl}" alt="Thumbnail"></td>
+                    <td class="col-thumb"><a href="${ytLink}" target="_blank"><img src="${thumbUrl}" alt="Thumbnail"></a></td>
                     <td class="col-title">
-                        <strong>${item.title}</strong>
+                        <strong><a href="${ytLink}" target="_blank">${item.title}</a></strong>
                         <p>Matched: ${item.ocr_name}</p>
+                        <p>Uploader: ${item.uploader}</p>
                     </td>
                     <td class->${formatTimestamp(item.timestamp)}</td>
-                    <td class->Uploader: ${item.uploader}</td>
                     <td class="col-links">
                         <a href="${ytLink}&t=${item.timestamp}s" target="_blank" class="btn-link">Video</a>
                     </td>
@@ -242,8 +243,13 @@ document.addEventListener('DOMContentLoaded', () => {
             </table>
         `;
         ocrResultsEl.innerHTML = tableHtml;
+    };
+    document.getElementById('ocr-search').addEventListener('input', (e) => {
+        OCRsearchPlayer(e.target.value);
     });
-
+    document.getElementById('player-search').addEventListener('input', (e) => {
+        searchPlayer(e.target.value);
+    });
     // --- Start the app ---
     loadData();
 });

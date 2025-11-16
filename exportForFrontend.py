@@ -82,6 +82,7 @@ def export_data():
     # 3. Build OCR Search Index
     print(f"Loading {MATCHES_JSON} to build OCR index...")
     ocr_index = []
+    last_battle = 0
     try:
         with open(MATCHES_JSON, 'r') as f:
             matches_data = json.load(f)
@@ -89,6 +90,8 @@ def export_data():
         for video_id, video_info in matches_data.items():
             video_title = video_info.get("title", "Unknown Title")
             upload_date = video_info.get("upload_date", "")
+            if upload_date != "" and int(upload_date) > last_battle:
+                last_battle = int(upload_date)
             uploader = video_info.get("uploader", "N/A")
             for timestamp, data in video_info.get("screenshots", {}).items():
                 ocr_players = data.get("players_ocr", [])
@@ -112,7 +115,8 @@ def export_data():
     frontend_data = {
         "player_index": player_index,       # For Search 1
         "battle_matches": battle_matches,   # For Search 1
-        "ocr_index": ocr_index              # For Search 2
+        "ocr_index": ocr_index,             # For Search 2
+        "last_battle": last_battle
     }
     
     with open(FRONTEND_DATA_OUTPUT, 'w') as f:

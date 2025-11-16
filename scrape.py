@@ -23,6 +23,8 @@ SCREENSHOT_DIR = "data/AllBarScreenshots"
 
 FETCH_FROM = "20240601"
 
+SCREENSHOT_DATA = "data/screenshot_data.json"
+
 def populateHaveSet():
     file_names = set()
     if os.path.exists(SCREENSHOT_DIR) and os.path.isdir(SCREENSHOT_DIR):
@@ -291,7 +293,7 @@ def get_channel_screenshots(channel_url, output_dir, game_tag=""):
                 print("No video entries found after flattening playlists.")
                 return
             
-            additions, updates = update_video_database(videos, 'screenshot_data.json')
+            additions, updates = update_video_database(videos, SCREENSHOT_DATA)
             print(f"Database: {additions} new videos added, {updates} existing videos updated.")
             print(f"Found {len(videos)} videos (post-date-filter). Submitting to processing pool...")
 

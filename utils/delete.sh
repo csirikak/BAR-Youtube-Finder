@@ -19,8 +19,8 @@
 # Set to 'true' to only print what *would* be deleted.
 : "${DRY_RUN:=FALSE}"
 
-# The directory to clean. Defaults to the current directory (".").
-: "${TARGET_DIR:="."}"
+# The directory to clean.
+: "${TARGET_DIR:="data/AllBarScreenshots"}"
 
 # The minimum dimensions
 MIN_WIDTH=1280
