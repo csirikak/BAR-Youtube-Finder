@@ -398,6 +398,7 @@ def get_channel_screenshots(channel_url, output_dir, game_tag=""):
 # --- --- --- --- ---
 if __name__ == "__main__":
     channels = [
+        "https://www.youtube.com/channel/UC-QkFO7qGgPv5J3c8pGOpIQ/recent",
         "https://www.youtube.com/@BetterStrategy/videos",
         "https://www.youtube.com/@JAWSMUNCH304/videos",
         "https://www.youtube.com/@simplygraceful1/videos",
