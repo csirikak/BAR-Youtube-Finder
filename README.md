@@ -78,8 +78,8 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 1.  **Clone Repository**
 
     ```bash
-    git clone https://github.com/your-username/bar-video-finder.git
-    cd bar-video-finder
+    git clone https://github.com/csirikak/BAR-Youtube-Finder.git
+    cd BAR-Youtube-Finder
     ```
 
 2.  **Create Python Environment**
