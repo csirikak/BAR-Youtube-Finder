@@ -345,35 +345,55 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
         
-        let tableRows = [];
+        let allCollectedMatches = [];
+
         for (const battle_id of battle_ids) {
             const matches = allData.battle_matches[battle_id] || [];
-            
             for (const match of matches) {
-                const ytLink = `https://www.youtube.com/watch?v=${match.video_id}`;
-                const replayLink = `https://www.beyondallreason.info/replays?gameId=${battle_id}`;
-                const thumbUrl = `https://i.ytimg.com/vi/${match.video_id}/mqdefault.jpg`;
-                const formattedISOString = match.upload_date.slice(0, 4) + '-' + match.upload_date.slice(4, 6) + '-' + match.upload_date.slice(6, 8);
-                var date = 'N/A';
-                if (match.upload_date != `N/A`) {
-                    date = (new Date(formattedISOString)).toDateString();  
-                }
-                tableRows.push(`
-                    <tr>
-                        <td class="col-thumb"><a href="${ytLink}" target="_blank"><img src="${thumbUrl}" href="${ytLink}" alt="Thumbnail"></a></td>
-                        <td class="col-title">
-                            <a href="${ytLink}" target="_blank"><strong>${match.title}</strong></a>
-                            <p>Found at: ${formatTimestamp(match.timestamp)}</p>
-                            <p>Uploader: ${match.uploader}</p>
-                        </td>
-                        <td class="col-date">${date}</td>
-                        <td class="col-links">
-                            <a href="${replayLink}" target="_blank" class="btn-link">Replay</a>
-                            <a href="${ytLink}&t=${match.timestamp}s" target="_blank" class="btn-link">Video</a>
-                        </td>
-                    </tr>
-                `);
+                // We keep 'match' and 'battle_id' together so we can use both later
+                allCollectedMatches.push({ match, battle_id });
             }
+        }
+
+        // 2. Sort the array descending (Newest dates first)
+        // Uses the logic: b - a
+        allCollectedMatches.sort((a, b) => {
+            return b.match.upload_date - a.match.upload_date;
+        });
+
+        // 3. Generate the HTML rows from the sorted data
+        let tableRows = [];
+
+        for (const item of allCollectedMatches) {
+            const match = item.match;
+            const battle_id = item.battle_id;
+
+            const ytLink = `https://www.youtube.com/watch?v=${match.video_id}`;
+            const replayLink = `https://www.beyondallreason.info/replays?gameId=${battle_id}`;
+            const thumbUrl = `https://i.ytimg.com/vi/${match.video_id}/mqdefault.jpg`;
+            
+            // Format Date
+            const formattedISOString = match.upload_date.slice(0, 4) + '-' + match.upload_date.slice(4, 6) + '-' + match.upload_date.slice(6, 8);
+            let date = 'N/A';
+            if (match.upload_date != `N/A`) {
+                date = (new Date(formattedISOString)).toDateString();  
+            }
+
+            tableRows.push(`
+                <tr>
+                    <td class="col-thumb"><a href="${ytLink}" target="_blank"><img src="${thumbUrl}" href="${ytLink}" alt="Thumbnail"></a></td>
+                    <td class="col-title">
+                        <a href="${ytLink}" target="_blank"><strong>${match.title}</strong></a>
+                        <p>Found at: ${formatTimestamp(match.timestamp)}</p>
+                        <p>Uploader: ${match.uploader}</p>
+                    </td>
+                    <td class="col-date">${date}</td>
+                    <td class="col-links">
+                        <a href="${replayLink}" target="_blank" class="btn-link">Replay</a>
+                        <a href="${ytLink}&t=${match.timestamp}s" target="_blank" class="btn-link">Video</a>
+                    </td>
+                </tr>
+            `);
         }
 
         if (tableRows.length === 0) {
@@ -425,7 +445,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 <tr>
                     <td class="col-thumb"><a href="${ytLink}" target="_blank"><img src="${thumbUrl}" alt="Thumbnail"></a></td>
                     <td class="col-title">
-                        <strong><a href="${ytLink}" target="_blank">${item.title}</a></strong>
+                        <a href="${ytLink}" target="_blank"><strong>${item.title}</strong></a>
                         <p>Matched: ${item.ocr_name}</p>
                         <p>Uploader: ${item.uploader}</p>
                     </td>

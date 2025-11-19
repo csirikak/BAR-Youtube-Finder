@@ -8,7 +8,7 @@ import time
 
 # Use the much faster rapidfuzz library (drop-in replacement for thefuzz)
 # pip install rapidfuzz
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 
 # Used for 6-month date calculation
 # pip install python-dateutil
@@ -21,7 +21,7 @@ OUTPUT_JSON_FILE = 'data/matches_output.json'
 
 # A battle must have a score of at least this to be considered a match.
 # (0-100 scale from rapidfuzz)
-MINIMUM_MATCH_THRESHOLD = 30
+MINIMUM_MATCH_THRESHOLD = 50
 
 # Number of processes to use for matching. Defaults to your system's CPU count.
 # Using ProcessPoolExecutor, so this is now # of processes, not threads.
@@ -178,22 +178,33 @@ def find_best_match(ocr_player_list, video_upload_date_str, inverted_index, batt
         return None, 0
         
     # 4. SCORE: Find the best match among the valid candidates
+    # Convert set to list for stability
     best_score = -1
     best_battle_id = None
     
-    # Convert the ocr_name_set to a list ONCE for rapidfuzz
-    ocr_name_list = list(ocr_name_set)
+    # Pre-convert OCR list to a single string for token algorithms
+    # This is faster and more robust for token_sort_ratio
+    ocr_str = " ".join(ocr_player_list)
     
     for battle_id in valid_candidates:
         clean_player_set = battle_data[battle_id]['players']
-        
-        # rapidfuzz requires a list, not a set.
         clean_player_list = list(clean_player_set)
         
-        # token_set_ratio is excellent for this.
-        # It compares two sets of strings, ignoring order and duplicates,
-        # and handles partial matches well.
-        score = fuzz.token_set_ratio(ocr_name_list, clean_player_list)
+        # Join the battle roster into a string
+        battle_str = " ".join(clean_player_list)
+        
+        # 1. Set Ratio: Checks if OCR is a valid SUBSET of Battle
+        # Returns 100 for (a,b) vs (a,b,c,d)
+        score_set = fuzz.token_set_ratio(ocr_str, battle_str)
+        
+        # 2. Sort Ratio: Checks if the TOTAL CONTENT matches
+        # Returns ~50 for (a,b) vs (a,b,c,d) because of length difference
+        score_sort = fuzz.token_sort_ratio(ocr_str, battle_str)
+        
+        # 3. Hybrid Score: Average them
+        # (a,b) -> (100 + 50) / 2 = 75
+        # (a,b,c,d) -> (100 + 100) / 2 = 100
+        score = (score_set + score_sort) / 2
         
         if score > best_score:
             best_score = score
@@ -202,7 +213,6 @@ def find_best_match(ocr_player_list, video_upload_date_str, inverted_index, batt
     if best_score >= MINIMUM_MATCH_THRESHOLD:
         return best_battle_id, best_score
     else:
-        # Match was not good enough
         return None, best_score
 
 
@@ -322,6 +332,7 @@ def main():
         max_workers=MAX_WORKERS,
         initializer=init_worker,
         initargs=(inverted_index, battle_data) # Pass large data to initializer
+        
     ) as executor:
         
         # Use executor.map to process tasks in parallel
