@@ -6,17 +6,48 @@
     --primary-color: #4a90e2;
     --font-main: 'Poppins', sans-serif;
 }
+
 body, html {
     font-family: var(--font-main);
     background-color: var(--bg-color);
     color: var(--text-color);
     margin: 0;
-    padding: 20px;
+    padding: 0; /* Changed from 20px to 0 so the top bar touches edges */
 }
+
+/* --- TOP BAR STYLES --- */
+.top-bar {
+    background-color: #111; /* Slightly darker than bg-color */
+    padding: 10px 20px;
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 20px;
+    font-size: 0.9rem;
+    border-bottom: 1px solid var(--border-color);
+}
+.top-bar a {
+    color: var(--text-color);
+    text-decoration: none;
+    opacity: 0.8;
+    transition: opacity 0.2s;
+}
+.top-bar a:hover {
+    opacity: 1;
+    text-decoration: underline;
+    color: var(--primary-color);
+}
+.top-bar span {
+    color: #888;
+    font-size: 0.85rem;
+}
+
 .container {
-    max-width: 1200px; /* Wider container for tabs */
+    max-width: 1200px;
     margin: 0 auto;
+    padding: 20px; /* Added padding here to compensate for body padding removal */
 }
+
 h1, h2 {
     font-weight: 600;
     color: var(--primary-color);
@@ -26,6 +57,12 @@ h1, h2 {
 h1 {
     text-align: left;
     margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 15px;
+}
+.logo-img {
+    vertical-align: middle;
 }
 
 /* This is now the tab panel itself */

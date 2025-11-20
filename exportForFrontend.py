@@ -149,6 +149,7 @@ def export_data():
                         
     except Exception as e:
         print(f"Error processing {MATCHES_JSON}: {e}")
+        return False
 
     # 5. Compile and save all data
     print(f"Saving compiled data to {FRONTEND_DATA_OUTPUT}...")
@@ -174,6 +175,7 @@ def export_data():
     print(f"Total battles with video matches: {len(battle_matches)}")
     print(f"Total OCR names indexed: {len(ocr_index)}")
     print(f"Total unique maps indexed: {len(all_map_names)}")
+    return True
 
 if __name__ == "__main__":
     export_data()

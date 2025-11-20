@@ -292,14 +292,14 @@ def get_channel_screenshots(channel_url, output_dir, game_tag=""):
     
     except yt_dlp.utils.DownloadError as e:
         print(f"\n[ERROR] A yt-dlp error occurred during flat fetch: {e}")
-        return
+        return False
     except Exception as e:
         print(f"\n[ERROR] An unexpected error occurred: {e}")
-        return
+        return False
 
     if not channel_info or 'entries' not in channel_info or not channel_info['entries']:
         print("No new videos found matching your criteria.")
-        return
+        return True
 
     # The videos are already flat, so we just grab the list
     videos_to_process = channel_info['entries']
@@ -356,7 +356,7 @@ def get_channel_screenshots(channel_url, output_dir, game_tag=""):
 
     except Exception as e:
         print(f"[ERROR] Failed to initialize YoutubeDL for Stage 2: {e}")
-        return
+        return False
 
     print(f"\nMetadata fetch complete. Found {len(full_videos_to_process)} processable videos.")
     print("Submitting screenshot processing to parallel thread pool...")
@@ -393,6 +393,7 @@ def get_channel_screenshots(channel_url, output_dir, game_tag=""):
                     
             except Exception as e:
                 print(f"[ERROR] Thread for video ID {video_id_from_future} failed: {e}")
+    return True
 # --- --- --- --- ---
 #      RUN SCRIPT
 # --- --- --- --- ---
