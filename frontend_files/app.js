@@ -4,6 +4,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const tabButtons = document.querySelectorAll('.tab-btn');
     const tabContents = document.querySelectorAll('.tab-content');
 
+    const params = new URLSearchParams(window.location.search);
+    const data = params.get('playerName');
+    if (data) {
+        localStorage.setItem('lastPlayerQuery', data);
+    }
     tabButtons.forEach(button => {
         button.addEventListener('click', () => {
             // Get the target tab ID from the button's data attribute
@@ -40,7 +45,21 @@ document.addEventListener('DOMContentLoaded', () => {
     const mapSearchInput = document.getElementById('map-search');
     
     const loadingEl = document.getElementById('loading');
+    
+    function updateBarStatsLink(playerName) {
+        const link = document.getElementById('barstats-link');
+        if (!link) return;
 
+        const baseUrl = "http://bar-stats.pro/playerstats";
+        
+        if (playerName && playerName.trim().length > 0) {
+            // Encode the name to handle spaces and special characters safely
+            link.href = `${baseUrl}?playerName=${encodeURIComponent(playerName.trim())}`;
+        } else {
+            // Reset to base URL if input is empty
+            link.href = baseUrl;
+        }
+    }
     // --- Main Data Loading Function ---
     async function loadData() {
         loadingEl.style.display = 'block';
@@ -332,6 +351,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Search 1: Player Search (Exact) ---
     function searchPlayer(query) {
+        updateBarStatsLink(query);
         playerResultsEl.innerHTML = ''; // Clear previous results
         localStorage.setItem('lastPlayerQuery', query);
         if (!query || !allData.player_index) {

@@ -3,3 +3,4 @@ bgutil-ytdlp-pot-provider/
 matches_output.json
 data/
 update.py
+*.pyc
