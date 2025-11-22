@@ -524,9 +524,9 @@ document.addEventListener('DOMContentLoaded', () => {
             
             tableRows.push(`
                 <tr>
-                    <td class="col-thumb"><a href="${ytLink}&t=${item.timestamp}s" target="_blank"><img src="${thumbUrl}" alt="Thumbnail"></a></td>
+                    <td class="col-thumb"><a href="${ytLink}&t=${match.timestamp}s" target="_blank"><img src="${thumbUrl}" alt="Thumbnail"></a></td>
                     <td class="col-title">
-                        <a href="${ytLink}&t=${item.timestamp}s" target="_blank"><strong>${match.title}</strong></a>
+                        <a href="${ytLink}&t=${match.timestamp}s" target="_blank"><strong>${match.title}</strong></a>
                         <p>Found at: ${formatTimestamp(match.timestamp)}</p>
                         <p>Uploader: ${match.uploader}</p>
                     </td>
