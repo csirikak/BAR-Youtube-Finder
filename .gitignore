@@ -4,3 +4,5 @@ matches_output.json
 data/
 update.py
 *.pyc
+playerName.py
+players_database.db
