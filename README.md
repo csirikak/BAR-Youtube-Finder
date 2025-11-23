@@ -151,9 +151,6 @@ python -m http.server 8000
 │   ├── app.js               # JavaScript for the frontend
 │   ├── frontend_data.json   # (Generated) The final JSON for the UI
 │   └── style.css            # CSS for the frontend
-├── utils/
-|   ├── delete.ps1               # (Utility) PowerShell script to delete small images
-|   └── delete.sh                # (Utility) Bash script to delete small images
 ├── yolo_dataset/            # (Generated) Staging area for YOLO training
 ├── yolo_labels/             # (Generated) Labels from bbox.py
 │

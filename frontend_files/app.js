@@ -401,9 +401,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
             tableRows.push(`
                 <tr>
-                    <td class="col-thumb"><a href="${ytLink}" target="_blank"><img src="${thumbUrl}" href="${ytLink}" alt="Thumbnail"></a></td>
+                    <td class="col-thumb"><a href="${ytLink}&t=${match.timestamp}s" target="_blank"><img src="${thumbUrl}" href="${ytLink}&t=${match.timestamp}s" alt="${match.title}"></a></td>
                     <td class="col-title">
-                        <a href="${ytLink}" target="_blank"><strong>${match.title}</strong></a>
+                        <a href="${ytLink}&t=${match.timestamp}s" target="_blank"><strong>${match.title}</strong></a>
                         <p>Found at: ${formatTimestamp(match.timestamp)}</p>
                         <p>Uploader: ${match.uploader}</p>
                     </td>
@@ -463,7 +463,7 @@ document.addEventListener('DOMContentLoaded', () => {
             
             return `
                 <tr>
-                    <td class="col-thumb"><a href="${ytLink}&t=${item.timestamp}s" target="_blank"><img src="${thumbUrl}" alt="Thumbnail"></a></td>
+                    <td class="col-thumb"><a href="${ytLink}&t=${item.timestamp}s" target="_blank"><img src="${thumbUrl}" alt="${item.title}"></a></td>
                     <td class="col-title">
                         <a href="${ytLink}&t=${item.timestamp}s" target="_blank"><strong>${item.title}</strong></a>
                         <p>Matched: ${item.ocr_name}</p>
@@ -524,7 +524,7 @@ document.addEventListener('DOMContentLoaded', () => {
             
             tableRows.push(`
                 <tr>
-                    <td class="col-thumb"><a href="${ytLink}&t=${match.timestamp}s" target="_blank"><img src="${thumbUrl}" alt="Thumbnail"></a></td>
+                    <td class="col-thumb"><a href="${ytLink}&t=${match.timestamp}s" target="_blank"><img src="${thumbUrl}" alt="${match.title}"></a></td>
                     <td class="col-title">
                         <a href="${ytLink}&t=${match.timestamp}s" target="_blank"><strong>${match.title}</strong></a>
                         <p>Found at: ${formatTimestamp(match.timestamp)}</p>

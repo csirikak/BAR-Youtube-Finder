@@ -6,3 +6,5 @@ update.py
 *.pyc
 playerName.py
 players_database.db
+manager.py
+logs/

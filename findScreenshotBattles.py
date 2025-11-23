@@ -28,7 +28,7 @@ MINIMUM_MATCH_THRESHOLD = 50
 MAX_WORKERS = os.cpu_count() or 20
 
 # How far back from the video upload date to search for battles
-MAX_DATE_RANGE_MONTHS = 6
+MAX_DATE_RANGE_MONTHS = 8
 
 # Mininum number of OCR recognitions to perform a compare.
 MIN_LEN = 6
