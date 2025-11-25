@@ -389,7 +389,8 @@ def get_channel_screenshots(channel_url, output_dir, game_tag=""):
                 if count > 0:
                     print(f"+++ SUCCESS (ID: {vid_id}): Grabbed {count} new screenshot(s) from '{message.replace('Processed ', '')}'")
                 elif "Skipped" in message:
-                    pass # print(f"--- INFO (ID: {vid_id}): {message}")
+                    print(f"--- INFO (ID: {vid_id}): {message}")
+                    pass 
                     
             except Exception as e:
                 print(f"[ERROR] Thread for video ID {video_id_from_future} failed: {e}")
