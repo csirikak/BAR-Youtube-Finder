@@ -235,7 +235,8 @@ def process_video_screenshots(video, output_dir, game_tag=""):
             '-ss', str(timestamp_sec), 
             '-i', stream_url,
             '-vframes', '1',
-            '-y', 
+            '-reconnect', '1',
+            '-y',
             output_filename
         ])
         try:
