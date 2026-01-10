@@ -1,12 +1,12 @@
 # BAR Video Battle Finder
 
-This repository contains a complete data engineering pipeline designed to find and link "Beyond All Reason" (BAR) gameplay moments from YouTube videos to their specific, corresponding battle replays.
+This repository contains a complete pipeline designed to find and link Beyond All Reason (BAR) gameplay moments from YouTube videos to their specific, corresponding battle replays.
 
 It works by scraping YouTube channels for BAR content, using computer vision (YOLO) to find player lists in screenshots, performing OCR to extract player names, and then fuzzy-matching those names against a comprehensive SQLite database of all official BAR replays.
 
 The final result is a searchable web frontend that allows you to find videos of a specific player or fuzzy-search for a player name and get a direct link to the YouTube video and timestamp where they appeared.
 
-## 🚀 Features
+## Features
 
   * **YouTube Scraper**: Downloads video metadata and screenshots from specified channels using `yt-dlp`.
   * **Replay Database Ingestion**: Pulls all battle replay metadata from the official `api.bar-rts.com` into a local SQLite database.
@@ -15,7 +15,7 @@ The final result is a searchable web frontend that allows you to find videos of 
   * **Fuzzy-Matching Core**: Implements a parallelized, high-speed fuzzy matching algorithm (`rapidfuzz`) to link a list of OCR'd players from a screenshot to a specific battle ID.
   * **Web Frontend**: Provides a simple, fast, all-client-side search page (`index.html`) to query the final, linked data.
 
-## ⚙️ How It Works: The Data Pipeline
+## How It Works
 
 This project is a multi-stage pipeline. The scripts must be run in a specific order to correctly build the dataset.
 
@@ -23,7 +23,7 @@ This project is a multi-stage pipeline. The scripts must be run in a specific or
 
 Before you can process screenshots, you need to train the YOLO model to find the player list.
 
-1.  **Collect Screenshots**: Manually gather a few hundred screenshots from BAR videos and place them in the `training_screenshots` folder.
+1.  **Collect Screenshots**: Manually gather a few hundred screenshots from BAR videos and place them in the `training_screenshots` folder, use `scrape.py` to make this easier.
 2.  **Label Data**: Run `python bbox.py label`. This opens an OpenCV window. Click the top-left corner of the player UI panel. The bottom-right is assumed to be the edge of the screen. Press `SPACE` to save and advance.
 3.  **Train Model**: Run `python bbox.py train`. This uses the labels you just created to train a YOLO model. It will save the best model as `ui_detector.pt`.
 
@@ -47,7 +47,7 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
     `python scrape.py`
 
       * This script reads the list of YouTube channels and uses `yt-dlp` to fetch video metadata (saving to `screenshot_data.json`).
-      * It then uses `ffmpeg` to take screenshots at a set interval (e.g., every 12 minutes) and saves them to `AllBarScreenshots/`.
+      * It then uses `ffmpeg` to take screenshots at a set interval (e.g., every 12 minutes to be shorter than the average length of a battle) and saves them to `AllBarScreenshots/`.
 
 4.  **Run OCR on Screenshots**:
     `python processScreenshotsRapidOCR.py`
@@ -73,7 +73,7 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 
       * Serve the repository folder with a simple HTTP server (e.g., `python -m http.server`) and open `index.html` in your browser. The page will load `frontend_data.json` and provide a search interface.
 
-## 🛠️ Setup & Installation
+## Setup & Installation
 
 1.  **Clone Repository**
 
@@ -104,7 +104,7 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
       * **yt-dlp**: This needs some special setup like node for the JS exection provider, or a PO server. Check the repo for more info.
       * **(Optional)** `exiftool` or `imagemagick`: The `delete.sh` script uses these.
 
-## 🏃 Usage (Pipeline Order)
+## Usage (Pipeline Order)
 
 ```bash
 # --- ONE-TIME SETUP ---
