@@ -27,16 +27,32 @@ SCREENSHOT_DATA = "data/screenshot_data.json"
 DB_LOCK = threading.Lock()
 
 def populateHaveSet():
-    file_names = set()
+    unique_ids = set()
+
+    # 1. Process files in the Screenshot Directory
     if os.path.exists(SCREENSHOT_DIR) and os.path.isdir(SCREENSHOT_DIR):
         for entry in os.listdir(SCREENSHOT_DIR):
             full_path = os.path.join(SCREENSHOT_DIR, entry)
             if os.path.isfile(full_path):
-                entry = re.sub(r"_\d+s\.png$", '', entry)
-                file_names.add(entry.strip())
+                # Remove suffix to get the raw ID (e.g. "abc_30s.png" -> "abc")
+                video_id = re.sub(r"_\d+s\.png$", '', entry)
+                unique_ids.add(video_id.strip())
     
+    # 2. Process keys in the JSON Data file
+    if os.path.exists(SCREENSHOT_DATA) and os.path.isfile(SCREENSHOT_DATA):
+        try:
+            with open(SCREENSHOT_DATA, 'r') as f:
+                data = json.load(f)
+                # Iterate through keys to strip whitespace, ensuring " id " matches "id"
+                for video_id in data.keys():
+                    unique_ids.add(str(video_id).strip())
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Error reading {SCREENSHOT_DATA}: {e}")
+
+    # 3. Write sorted, unique IDs to file
     with open("/tmp/haveScreenshots.txt", 'w') as f:
-        for line in file_names:
+        # sorted() makes the output deterministic and easier to read
+        for line in sorted(unique_ids):
             f.write(f"youtube {line}\n")
 
 populateHaveSet()
