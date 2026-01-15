@@ -141,27 +141,6 @@ def update_video_database(video_list, db_filepath='screenshot_data.json'):
         # 4. Return the result
         return (additions_count, updates_count)
 
-def fetch_and_process_video(ydl_instance, video_url, output_dir, game_tag):
-    """
-    Helper function for Stage 2.
-    Fetches full metadata for a single video URL and then
-    passes that metadata to the screenshot processing function.
-    """
-    try:
-        # This is the network call to get stream URLs
-        
-        
-        # Now we have the full info, update the database
-        
-        
-        # And process the screenshots
-        return process_video_screenshots(full_video_info, output_dir, game_tag)
-        
-    except Exception as e:
-        # This error is for the *individual* video fetch
-        print(f"[WARN] Failed to fetch full metadata for {video_url}: {e}")
-        return None, f"Skipped (Failed full fetch: {e})", 0
-
 def process_video_screenshots(video, output_dir, game_tag=""):
     """
     Processes a single video entry:
