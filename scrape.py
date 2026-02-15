@@ -43,9 +43,11 @@ def populateHaveSet():
         try:
             with open(SCREENSHOT_DATA, 'r') as f:
                 data = json.load(f)
-                # Iterate through keys to strip whitespace, ensuring " id " matches "id"
-                for video_id in data.keys():
-                    unique_ids.add(str(video_id).strip())
+                unique_ids.update(
+                    str(vid).strip() 
+                    for vid, content in data.items() 
+                    if content.get("screenshots") is not None
+                )
         except (json.JSONDecodeError, IOError) as e:
             print(f"Error reading {SCREENSHOT_DATA}: {e}")
 

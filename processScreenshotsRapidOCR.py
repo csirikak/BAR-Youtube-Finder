@@ -1,6 +1,6 @@
 import cv2
 from pathlib import Path
-from rapidocr import RapidOCR
+from rapidocr import RapidOCR, EngineType
 import re
 import os
 import json  # Added for JSON output
@@ -293,7 +293,15 @@ def init_pool(initialData, lock):
     global yolo_model, reader, worker_data, worker_lock
     worker_data = initialData
     worker_lock = lock
-    reader = RapidOCR()
+    reader = RapidOCR(
+        params={
+        "Det.engine_type": EngineType.TORCH,          
+        "Cls.engine_type": EngineType.TORCH,
+        "Rec.engine_type": EngineType.TORCH,
+        "EngineConfig.torch.use_cuda": True,  # 使用torch GPU版推理
+        "EngineConfig.torch.cuda_ep_cfg.device_id": 0,  # 指定GPU id
+        }
+    )
     if Path(MODEL_PATH).exists():
         try:
             print(f"Loading YOLO model from {MODEL_PATH} in process {os.getpid()}...")
