@@ -273,8 +273,7 @@ def get_channel_screenshots(channel_url, output_dir, game_tag=""):
         'extract_flat': 'in_playlist',
         'daterange': DateRange(start=FETCH_FROM),
         'download_archive': '/tmp/haveScreenshots.txt',
-        'impersonate': impersonate.ImpersonateTarget("safari", "26.0"),
-        'extractor_args': {"youtube":{"player_client": ["tv_simply"]}},
+        'extractor_args': {"youtube":{"player_client": ['default', 'mweb']}},
         'js_runtimes': {'node':{}},
         'quiet': False,
         'ignoreerrors': True,
@@ -314,10 +313,10 @@ def get_channel_screenshots(channel_url, output_dir, game_tag=""):
     # These are the options needed to get stream URLs
     full_fetch_opts = {
         'format': 'bestvideo*+bestaudio/best',
-        'impersonate': impersonate.ImpersonateTarget("safari", "26.0"),
-        'extractor_args': {"youtube":{"player_client": ["tv_simply"]}},
+        'extractor_args': {"youtube":{"player_client": ['default', 'mweb']}},
         'js_runtimes': {'node':{}},
         'quiet': False,
+        'verbose': True
     }
     print("Stage 2: Fetching full metadata for new videos sequentially...")
     full_videos_to_process = []
