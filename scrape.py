@@ -226,9 +226,6 @@ def process_video_screenshots(video, output_dir, game_tag=""):
             ffmpeg_command.extend(['-headers', header_string])
 
         ffmpeg_command.extend([
-            '-hwaccel', 'cuda',                 # 1. Force cuda
-            '-hwaccel_device', '/dev/dri/renderD128', # 2. Select the CUDA GPU
-            '-hwaccel_output_format', 'yuv420p', # 3. Copy frame from GPU to CPU
             '-ss', str(timestamp_sec), 
             '-i', stream_url,
             '-vframes', '1',
