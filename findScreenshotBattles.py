@@ -25,7 +25,7 @@ MINIMUM_MATCH_THRESHOLD = 50
 
 # Number of processes to use for matching. Defaults to your system's CPU count.
 # Using ProcessPoolExecutor, so this is now # of processes, not threads.
-MAX_WORKERS = os.cpu_count() or 20
+MAX_WORKERS = 8 #os.cpu_count() or 20
 
 # How far back from the video upload date to search for battles
 MAX_DATE_RANGE_MONTHS = 8
