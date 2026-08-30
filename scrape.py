@@ -220,16 +220,23 @@ def process_video_screenshots(video, output_dir, game_tag=""):
             continue
 
         # 6. Use ffmpeg to grab the screenshot
-        ffmpeg_command = ['ffmpeg']
+        ffmpeg_command = ['ffmpeg', '-nostdin']
         
         if header_string:
             ffmpeg_command.extend(['-headers', header_string])
 
+        # Reconnect + rw_timeout are INPUT options and must precede -i.
+        # -rw_timeout (microseconds) aborts a stalled socket read/write so a
+        # wedged remote stream can't hang a worker indefinitely; the
+        # subprocess timeout below is a hard wall-clock backstop.
         ffmpeg_command.extend([
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '30',
+            '-rw_timeout', '30000000',
             '-ss', str(timestamp_sec), 
             '-i', stream_url,
             '-vframes', '1',
-            '-reconnect', '1',
             '-y',
             output_filename
         ])
@@ -238,22 +245,72 @@ def process_video_screenshots(video, output_dir, game_tag=""):
                 ffmpeg_command,
                 check=True,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
+                timeout=120
             )
             screenshots_taken += 1
+        except subprocess.TimeoutExpired:
+            # ffmpeg wedged on a stalled stream: it was killed after 120s.
+            # Remove any partial/zero-byte output so the os.path.exists skip
+            # check above doesn't later treat it as an already-grabbed frame.
+            print(f"--- TIMEOUT (ffmpeg) for '{video_title}' at {timestamp_sec}s. Killed after 120s.")
+            if os.path.exists(output_filename):
+                try:
+                    os.remove(output_filename)
+                except OSError:
+                    pass
         except subprocess.CalledProcessError as e:
             # Print the error code for easier debugging
             print(f"--- FAILED (ffmpeg) for '{video_title}' at {timestamp_sec}s. Error: {e}")
+            if os.path.exists(output_filename):
+                try:
+                    os.remove(output_filename)
+                except OSError:
+                    pass
         except FileNotFoundError:
             print("\n[ERROR] 'ffmpeg' command not found.")
             return video_id, "Failed (ffmpeg not found)", screenshots_taken
     return video_id, f"Processed '{video_title}, format: {video.get("format")}'", screenshots_taken
 
 
-def get_channel_screenshots(channel_url, output_dir, game_tag=""):
+# Relevance-gate keyword sets. Matched (case-insensitive) against a video's
+# title/description; strong tags are matched exactly. Kept intentionally tight
+# so the gate has high precision on search-discovery results.
+BAR_TITLE_DESC_KEYS = ("beyond all reason", "beyondallreason", "bar-rts")
+BAR_STRONG_TAGS = ("beyond all reason", "bar")
+
+
+def is_bar_relevant(info):
+    """Cheap relevance gate on FULL metadata (title/description/tags).
+
+    Applied ONLY to untrusted discovery sources, and only in Stage 2 -- i.e.
+    AFTER the sequential metadata fetch but BEFORE the costly ffmpeg screenshot
+    grab and the downstream OCR pass. Curated channels bypass this entirely,
+    because BAR uploads there frequently have meme titles and bare descriptions
+    (e.g. only a twitch/discord link) that this gate would wrongly reject.
+    """
+    if not info:
+        return False
+    title = (info.get('title') or '').lower()
+    desc = (info.get('description') or '').lower()
+    tags = [t.lower() for t in (info.get('tags') or [])]
+    if any(k in title for k in BAR_TITLE_DESC_KEYS):
+        return True
+    if any(k in desc for k in BAR_TITLE_DESC_KEYS):
+        return True
+    if any(t in BAR_STRONG_TAGS for t in tags):
+        return True
+    return False
+
+
+def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_relevance=False):
     """
     Downloads screenshots from all videos in a channel using a 
     two-stage, library-only method to avoid rate-limiting.
+
+    If require_bar_relevance is True, each video is checked against
+    is_bar_relevant() on its full metadata before any screenshots are grabbed,
+    so irrelevant (non-BAR) videos never reach ffmpeg or OCR.
     """
     
     os.makedirs(output_dir, exist_ok=True)
@@ -336,6 +393,13 @@ def get_channel_screenshots(channel_url, output_dir, game_tag=""):
                     if not full_video_info:
                         print(f"[WARN] Failed to fetch full info for {video_stub.get('id')}.")
                         continue
+
+                    # 1b. RELEVANCE GATE (discovery/untrusted sources only).
+                    # Runs on full metadata BEFORE the costly ffmpeg grab + OCR,
+                    # so non-BAR videos are dropped here and never processed.
+                    if require_bar_relevance and not is_bar_relevant(full_video_info):
+                        print(f"[GATE] Skipping non-BAR '{full_video_info.get('title', 'N/A')}' (ID: {full_video_info.get('id')}).")
+                        continue
                         
                     # 2. UPDATE DATABASE SEQUENTIALLY
                     update_video_database([full_video_info], SCREENSHOT_DATA)
@@ -393,7 +457,10 @@ def get_channel_screenshots(channel_url, output_dir, game_tag=""):
 #      RUN SCRIPT
 # --- --- --- --- ---
 if __name__ == "__main__":
-    channels = [
+    # TRUSTED sources: curated BAR creators + the official channel. Scraped
+    # WITHOUT a relevance gate -- BAR videos here often have meme titles and
+    # bare descriptions that a metadata gate would wrongly discard.
+    trusted_sources = [
         "https://www.youtube.com/channel/UC-QkFO7qGgPv5J3c8pGOpIQ/recent",
         "https://www.youtube.com/@BetterStrategy/videos",
         "https://www.youtube.com/@JAWSMUNCH304/videos",
@@ -402,11 +469,36 @@ if __name__ == "__main__":
         "https://www.youtube.com/@BrightWorksTV/videos",
         "https://www.youtube.com/@MoreDrongo/videos",
         "https://www.youtube.com/@SuperKitowiec2/videos",
+        "https://www.youtube.com/@BeyondAllReason/videos",  # official channel (UC8E-VzcrJTWIG_scVnaQ1uA)
     ]
-    for channel in channels:
+
+    # DISCOVERY sources: keyword search + mixed-game channels that also post
+    # BAR. These can surface irrelevant videos, so require_bar_relevance=True
+    # gates each on full metadata BEFORE the costly ffmpeg grab + OCR.
+    # NOTE: 'ytsearchdate' is unsupported by the active handlers; plain
+    # 'ytsearch' works and orders by relevance.
+    discovery_sources = [
+        "ytsearch150:Beyond All Reason",
+        "ytsearch150:Beyond All Reason gameplay",
+        "ytsearch100:Beyond All Reason 8v8",
+        "ytsearch80:Beyond All Reason 1v1",
+        "https://www.youtube.com/@Wintergaming/videos",
+        "https://www.youtube.com/@disnof/videos",
+    ]
+
+    for channel in trusted_sources:
         get_channel_screenshots(
-            channel_url=channel, 
+            channel_url=channel,
             output_dir=SCREENSHOT_DIR,
-            game_tag=""  
+            game_tag="",
+            require_bar_relevance=False,
+        )
+
+    for source in discovery_sources:
+        get_channel_screenshots(
+            channel_url=source,
+            output_dir=SCREENSHOT_DIR,
+            game_tag="",
+            require_bar_relevance=True,
         )
     print("\nScript finished.")

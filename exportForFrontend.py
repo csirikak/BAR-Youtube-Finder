@@ -120,32 +120,20 @@ def export_data():
     conn.close()
     print("Database processing complete.")
 
-    # 4. Build OCR Search Index
-    print(f"Loading {MATCHES_JSON} to build OCR index...")
-    ocr_index = []
+    # 4. Determine most recent battle date from matches
+    #    (The fuzzy OCR search index was removed: it dominated the output
+    #     file size (~300k entries) and was slow to index client-side.
+    #     We still scan matches here only to derive last_battle.)
+    print(f"Loading {MATCHES_JSON} to determine last battle date...")
     last_battle = 0
     try:
         with open(MATCHES_JSON, 'r') as f:
             matches_data = json.load(f)
             
         for video_id, video_info in matches_data.items():
-            video_title = video_info.get("title", "Unknown Title")
             upload_date = video_info.get("upload_date", "")
             if upload_date != "" and int(upload_date) > last_battle:
                 last_battle = int(upload_date)
-            uploader = video_info.get("uploader", "N/A")
-            for timestamp, data in video_info.get("screenshots", {}).items():
-                ocr_players = data.get("players_ocr", [])
-                for player_name in ocr_players:
-                    if player_name:
-                        ocr_index.append({
-                            "ocr_name": player_name,
-                            "video_id": video_id,
-                            "timestamp": int(timestamp),
-                            "title": video_title,
-                            "upload_date": upload_date,
-                            "uploader": uploader
-                        })
                         
     except Exception as e:
         print(f"Error processing {MATCHES_JSON}: {e}")
@@ -161,7 +149,6 @@ def export_data():
         "player_index": player_index,       # For Search 1 (data)
         "all_player_names": all_player_names, # For Search 1 (autocomplete)
         "battle_matches": battle_matches,   # For Search 1 (data)
-        "ocr_index": ocr_index,             # For Search 2
         "map_index": map_index,             # For Search 3 (data)
         "all_map_names": all_map_names,     # For Search 3 (autocomplete)
         "last_battle": last_battle
@@ -173,7 +160,6 @@ def export_data():
     print("--- Export Complete ---")
     print(f"Total players indexed: {len(player_index)}")
     print(f"Total battles with video matches: {len(battle_matches)}")
-    print(f"Total OCR names indexed: {len(ocr_index)}")
     print(f"Total unique maps indexed: {len(all_map_names)}")
     return True
 

@@ -28,7 +28,6 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // --- Global Data Stores ---
     let allData = {};
-    let ocrSearcher = null; // This will be our Fuse.js instance
     let playerSearcher = null; // For player name autocomplete
     let mapSearcher = null; // For map name autocomplete
     
@@ -36,9 +35,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const playerResultsEl = document.getElementById('player-results');
     const playerAutocompleteEl = document.getElementById('player-autocomplete');
     const playerSearchInput = document.getElementById('player-search');
-    
-    const ocrResultsEl = document.getElementById('ocr-results');
-    const ocrSearchInput = document.getElementById('ocr-search');
     
     const mapResultsEl = document.getElementById('map-results');
     const mapAutocompleteEl = document.getElementById('map-autocomplete');
@@ -119,14 +115,6 @@ document.addEventListener('DOMContentLoaded', () => {
             // 7. Initialize Fuse.js instances
             loadingEl.innerText = 'Indexing data...';
             
-            // OCR Searcher (existing)
-            const ocrOptions = {
-                keys: ['ocr_name'],
-                includeScore: true,
-                threshold: 0.4,
-            };
-            ocrSearcher = new Fuse(allData.ocr_index, ocrOptions);
-            
             // Player Autocomplete Searcher (New)
             const playerOptions = {
                 includeScore: true,
@@ -147,11 +135,6 @@ document.addEventListener('DOMContentLoaded', () => {
             // --- (FIX) ATTACH EVENT LISTENERS ---
             // Now that searchers are initialized, attach listeners.
 
-            // OCR Search
-            ocrSearchInput.addEventListener('input', (e) => {
-                OCRsearchPlayer(e.target.value);
-            });
-            
             // Player Search (default options: minChars: 2, showOnFocus: false)
             setupAutocomplete(
                 playerSearchInput,
@@ -187,11 +170,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 mapSearchInput.value = localStorage.getItem('lastMapQuery');
                 searchMap(localStorage.getItem('lastMapQuery'));
             };
-            if (localStorage.getItem('lastPlayerOCRQuery')) {
-                ocrSearchInput.value = localStorage.getItem('lastPlayerOCRQuery');
-                OCRsearchPlayer(localStorage.getItem('lastPlayerOCRQuery'));
-            }
-            
         } catch (error) {
             loadingEl.innerText = 'Error Loading Data!';
             loadingEl.style.backgroundColor = 'red';
@@ -437,62 +415,6 @@ document.addEventListener('DOMContentLoaded', () => {
             </table>
         `;
         playerResultsEl.innerHTML = tableHtml;
-    };
-    
-    // --- Search 2: OCR Search (Fuzzy) ---
-    function OCRsearchPlayer(query) {
-        ocrResultsEl.innerHTML = ''; // Clear previous results
-        localStorage.setItem('lastPlayerOCRQuery', query);
-        
-        if (!query || !ocrSearcher) {
-            if(!ocrSearcher) console.error("OCR Searcher not initialized!");
-            return;
-        }
-        
-        const results = ocrSearcher.search(query, { limit: 20 });
-        
-        if (results.length === 0) {
-            ocrResultsEl.innerHTML = '<p>No fuzzy matches found in OCR data.</p>';
-            return;
-        }
-        
-        const tableRows = results.map(result => {
-            const item = result.item;
-            const ytLink = `https://www.youtube.com/watch?v=${item.video_id}`;
-            const thumbUrl = `https://i.ytimg.com/vi/${item.video_id}/mqdefault.jpg`;
-            
-            return `
-                <tr>
-                    <td class="col-thumb"><a href="${ytLink}&t=${item.timestamp}s" target="_blank"><img src="${thumbUrl}" alt="${item.title}"></a></td>
-                    <td class="col-title">
-                        <a href="${ytLink}&t=${item.timestamp}s" target="_blank"><strong>${item.title}</strong></a>
-                        <p>Matched: ${item.ocr_name}</p>
-                        <p>Uploader: ${item.uploader}</p>
-                    </td>
-                    <td class->${formatTimestamp(item.timestamp)}</td>
-                    <td class="col-links">
-                        <a href="${ytLink}&t=${item.timestamp}s" target="_blank" class="btn-link">Video</a>
-                    </td>
-                </tr>
-            `;
-        }).join('');
-
-        const tableHtml = `
-            <table class="results-table">
-                <thead>
-                    <tr>
-                        <th>Thumbnail</th>
-                        <th>Video</th>
-                        <th>Timestamp</th>
-                        <th>Link</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${tableRows}
-                </tbody>
-            </table>
-        `;
-        ocrResultsEl.innerHTML = tableHtml;
     };
     
     // --- Search 3: Map Search ---
