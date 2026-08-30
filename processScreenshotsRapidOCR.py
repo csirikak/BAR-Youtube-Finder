@@ -343,7 +343,13 @@ def process_file(path, DEBUG_MODE):
             
         results = ocr_bottom_right_element(str(path), debug=DEBUG_MODE, reader=reader, yolo_model=yolo_model)
         
-        if results:
+        # Record the frame even when OCR finds nothing, so an already-processed
+        # video stays in the have-set and a folder wipe does not re-scrape it.
+        # Metadata-only videos (never processed by Stage 4) still lack the
+        # screenshots key and are correctly re-scraped.
+        if not results:
+            results = []
+        if results is not None:
             # Use lock to safely read/write to the JSON
             with worker_lock:
                 # Read existing data
