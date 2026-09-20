@@ -46,8 +46,11 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 3.  **Scrape YouTube Videos**:
     `python scrape.py`
 
-      * This script reads the list of YouTube channels and uses `yt-dlp` to fetch video metadata (saving to `screenshot_data.json`).
-      * It then uses `ffmpeg` to take screenshots at a set interval (e.g., every 12 minutes to be shorter than the average length of a battle) and saves them to `AllBarScreenshots/`.
+      * This script reads the list of YouTube channels and uses `yt-dlp` to fetch video metadata (saving to `data/screenshot_data.json`).
+      * It uses `ffmpeg` to take screenshots at 1:30 and every 12 minutes thereafter, saving them to `data/AllBarScreenshots/`.
+      * Rerunning fills missing timestamps while preserving existing screenshots and OCR results. A video is complete only when every expected timestamp has a complete PNG or a saved OCR result (including an empty player list).
+      * Captures start as metadata arrives, with four concurrent workers. Failed streams try alternate formats and one URL refresh; incomplete captures remain eligible for the next run. The console includes FFmpeg errors and a per-source summary.
+      * Ongoing livestreams and videos with only segmented DASH streams are deferred. Rerun after YouTube makes a seekable recording available.
 
 4.  **Run OCR on Screenshots**:
     `python processScreenshotsRapidOCR.py`
@@ -91,7 +94,7 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 
 3.  **Install Python Dependencies**
     ```bash
-    pip install yt-dlp curl_cffi requests python-dateutil
+    pip install -U "yt-dlp[default]" "bgutil-ytdlp-pot-provider>=2.0.0" curl_cffi requests python-dateutil
     pip install opencv-python numpy
     pip install ultralytics torch
     pip install rapidocr-onnxruntime rapidfuzz
@@ -101,10 +104,13 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 4.  **Install External Dependencies**
 
       * **FFmpeg**: You must have `ffmpeg` installed and available in your system's `PATH`. This is required by `scrape.py` for taking screenshots.
-      * **yt-dlp**: This needs some special setup like node for the JS exection provider, or a PO server. Check the repo for more info.
+      * **YouTube JavaScript support**: Install a supported Deno or Node.js runtime (Node 22+ for the PO provider) and keep `yt-dlp[default]` current so its EJS challenge solver is installed. The scraper enables both runtimes. See the [yt-dlp EJS setup guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
+      * **YouTube PO tokens**: Some streams require a token provider. Install `bgutil-ytdlp-pot-provider` in the same Python environment and follow its [provider setup instructions](https://github.com/Brainicism/bgutil-ytdlp-pot-provider#installation). Keep the Python plugin and provider checkout on matching releases; use [2.0.0 or newer for its HTTP server security fixes](https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/tag/2.0.0). After updating the checkout, rebuild it with `npm ci` and `npx tsc` in its `server` directory. The scraper uses its HTTP server when available, or its script when built at `bgutil-ytdlp-pot-provider/server/build/generate_once.js` inside this repository. See the [yt-dlp PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide).
       * **(Optional)** `exiftool` or `imagemagick`: The `delete.sh` script uses these.
 
 ## Usage (Pipeline Order)
+
+Scraper regression tests (no YouTube requests): `python -m unittest discover -s tests -v`
 
 ```bash
 # --- ONE-TIME SETUP ---
