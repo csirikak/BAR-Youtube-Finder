@@ -1,9 +1,11 @@
 import base64
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -295,6 +297,70 @@ class ScraperTests(unittest.TestCase):
         client.extract_info.return_value = None
         with patch.object(scrape.yt_dlp, 'YoutubeDL', return_value=client):
             self.assertFalse(scrape.get_channel_screenshots('channel', self.output))
+
+    def test_frame_callback_sees_only_complete_successful_captures(self):
+        info = dict(video(duration=91), **stream())
+        delivered = []
+        def capture(selected, timestamp, filename):
+            Path(filename).write_bytes(PNG)
+            return None
+        def completed(path):
+            self.assertTrue(scrape.is_complete_png(path))
+            delivered.append(path.name)
+        with patch.object(scrape, 'capture_screenshot', side_effect=capture):
+            scrape.process_video_screenshots(info, self.output, on_screenshot=completed)
+        self.assertEqual(delivered, ['example_90s.png'])
+
+    def test_cancelled_capture_does_not_start_ffmpeg(self):
+        stop = threading.Event()
+        stop.set()
+        info = dict(video(duration=91), **stream())
+        with patch.object(scrape, 'capture_screenshot') as capture:
+            _, message, count = scrape.process_video_screenshots(
+                info, self.output, stop_event=stop)
+        self.assertTrue(message.startswith('Failed'))
+        self.assertEqual(count, 0)
+        capture.assert_not_called()
+
+    def test_borrowed_pool_drains_workers_before_closing_metadata_client_on_error(self):
+        failed_save = threading.Event()
+        refreshed = threading.Event()
+        client = Mock()
+        client_open = False
+        def enter():
+            nonlocal client_open
+            client_open = True
+            return client
+        def leave(*args):
+            nonlocal client_open
+            client_open = False
+        client.__enter__ = Mock(side_effect=enter)
+        client.__exit__ = Mock(side_effect=leave)
+        def extract(url, download=False):
+            self.assertTrue(client_open)
+            if url == "channel":
+                return {"entries": [{"id": "first"}, {"id": "second"}]}
+            return dict(video(url.rsplit("=", 1)[-1], duration=91), **stream())
+        client.extract_info.side_effect = extract
+        def save(videos, filename):
+            if videos[0]["id"] == "second":
+                failed_save.set()
+                return (0, 0)
+            return (1, 0)
+        def worker(info, directory, tag, processed, refresh, *args):
+            if not failed_save.wait(3):
+                raise RuntimeError("Second metadata write never ran")
+            refresh()
+            refreshed.set()
+            return info["id"], "Processed", 0
+        with ThreadPoolExecutor(max_workers=1) as shared, \
+             patch.object(scrape.yt_dlp, "YoutubeDL", return_value=client), \
+             patch.object(scrape, "update_video_database", side_effect=save), \
+             patch.object(scrape, "process_video_screenshots", side_effect=worker):
+            self.assertFalse(scrape.get_channel_screenshots(
+                "channel", self.output, capture_executor=shared))
+            self.assertTrue(refreshed.is_set(), "Metadata client closed before worker drained")
+            self.assertEqual(shared.submit(lambda: "still usable").result(), "still usable")
 
 
 if __name__ == '__main__':

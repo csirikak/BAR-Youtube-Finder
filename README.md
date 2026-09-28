@@ -55,9 +55,11 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 4.  **Run OCR on Screenshots**:
     `python processScreenshotsRapidOCR.py`
 
-      * This script loads the `ui_detector.pt` model.
-      * It scans all screenshots, finds the player UI panel, and runs `RapidOCR` to extract the list of player names.
-      * It updates `screenshot_data.json` with the new OCR results, linking them to the video ID and timestamp.
+      * Uses one GPU model instance per stage, batched YOLO panel detection, and PP-OCRv6 through RapidOCR's PyTorch backend. AMD ROCm uses the same `cuda` device interface as NVIDIA. CPU is selected automatically if no GPU is available.
+      * Uses larger recognition batches, skips rotation classification for upright screenshots, and tunes detection for small, dim player names. The local `players` table helps correct unambiguous OCR typos while preserving digits, clan tags, and Unicode names.
+      * Updates `data/screenshot_data.json` with atomic checkpoints every 50 frames and at completion/interruption. Completed frames are skipped before models load. Valid empty results are saved; failed frames remain eligible for retry and stop the enclosing pipeline before screenshot cleanup.
+      * Override defaults with `--device cpu`, `--device cuda:0`, `--batch-size 4`, or `--checkpoint-every 10`. Use `--reprocess` to replace saved results for screenshots still on disk. Rerun with the same flag if a reprocessing attempt fails.
+      * For an isolated evaluation: `python processScreenshotsRapidOCR.py --screenshots-dir path/to/samples --output-file data/ocr-evaluation.json`. See [OCR benchmark results](docs/ocr-benchmark.md) for the model comparison and limitations.
 
 5.  **Match OCR to Replays**:
     `python findScreenshotBattles.py`
@@ -96,10 +98,9 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
     ```bash
     pip install -U "yt-dlp[default]" "bgutil-ytdlp-pot-provider>=2.0.0" curl_cffi requests python-dateutil
     pip install opencv-python numpy
-    pip install ultralytics torch
-    pip install rapidocr-onnxruntime rapidfuzz
+    pip install ultralytics "rapidocr==3.9.2" rapidfuzz
     ```
-    There may be more, pip install them if you get an error.
+    Install a PyTorch build appropriate for your GPU before these commands. For AMD, keep `torch`, `torchvision`, and `triton` on compatible ROCm builds; do not replace a working AMD installation with generic PyPI wheels. OCR uses the `rapidocr` package and its Torch backend, not the older `rapidocr-onnxruntime` package. RapidOCR downloads its model weights on first use. The player-name database is optional; without it, names are returned without catalog corrections.
 
 4.  **Install External Dependencies**
 
@@ -110,7 +111,52 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 
 ## Usage (Pipeline Order)
 
-Scraper regression tests (no YouTube requests): `python -m unittest discover -s tests -v`
+For the complete update, run `python update_pipeline.py`. The local
+`update.py` entry point delegates to the same runner. It preserves the existing
+commit/push and screenshot-cleanup steps after a successful update.
+
+```mermaid
+flowchart LR
+    Start --> Sync[Replay database sync]
+    Start --> Capture[Two channels / four capture workers total]
+    Sync --> OCR[Streaming GPU OCR]
+    Capture -->|Completed screenshots| OCR
+    Capture --> Match[Replay matching]
+    OCR --> Match
+    Match --> Export[Frontend export]
+    Export --> Publish[Commit and push]
+    Publish --> Cleanup[Remove processed screenshots]
+```
+
+Replay sync runs alongside channel discovery and screenshot capture. Once the
+database commits, OCR reads the current player catalog and processes screenshots
+as they arrive. A shared metadata lock and merged OCR checkpoints preserve both
+new video metadata and recognition results. Duplicate video IDs are claimed once
+per run, and all channels share one bounded capture pool.
+
+The runner prints elapsed time for each stage and total wall time. Concurrent
+stage times include waits and should not be added together. Matching and export
+wait for their inputs; failed prerequisites, exports, or pushes stop cleanup.
+On cancellation, new work stops and in-flight requests finish within their
+timeouts. Successful OCR results remain checkpointed for the next run.
+
+```bash
+# Run the update while retaining screenshots and omitting commit/push.
+python update_pipeline.py --no-publish --keep-screenshots
+
+# Adjust concurrency; defaults shown.
+python update_pipeline.py --channel-workers 2 --capture-workers 4 --ocr-batch-size 8
+```
+
+Use `--no-warp` to leave the current network connection alone, or
+`--no-provider` when managing the PO provider separately. An existing healthy
+provider is reused; a provider started by this runner is stopped on exit.
+Configure the curated channel list in `update_pipeline.py`.
+
+Scraper, OCR, and update regression tests (no YouTube requests or GPU required):
+`python -m unittest discover -s tests -v`
+
+The individual stages can also be run in order:
 
 ```bash
 # --- ONE-TIME SETUP ---
@@ -167,6 +213,7 @@ python -m http.server 8000
 ├── processScreenshotsRapidOCR.py # Runs YOLO + OCR on all screenshots
 ├── scrape.py                # Scrapes YouTube channels for videos & screenshots
 ├── updateBattleDB.py        # Populates game_battles.db from the BAR API
+├── update_pipeline.py       # Concurrent capture, replay sync, and streaming OCR
 ├── updateSchema.py          # Adds video/match tables to the DB
 │
 └── ui_detector.pt           # (Generated) The trained YOLO model

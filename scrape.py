@@ -4,6 +4,7 @@ import os
 import threading
 from yt_dlp.utils import DateRange
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from contextlib import ExitStack, nullcontext
 import math
 import json
 import re
@@ -26,6 +27,14 @@ FETCH_FROM = "20240601"
 
 SCREENSHOT_DATA = "data/screenshot_data.json"
 DB_LOCK = threading.Lock()
+YTDLP_INIT_LOCK = threading.Lock()
+
+
+def youtube_client(options):
+    # Plugin loading mutates process-wide registries on the first constructor.
+    # Serialize construction only; each channel still extracts independently.
+    with YTDLP_INIT_LOCK:
+        return yt_dlp.YoutubeDL(options)
 
 def expected_timestamps(video):
     duration = video.get('duration')
@@ -247,7 +256,8 @@ def capture_screenshot(stream, timestamp_sec, output_filename):
 
 
 def process_video_screenshots(video, output_dir, game_tag="",
-                              processed_timestamps=(), refresh_video=None):
+                              processed_timestamps=(), refresh_video=None,
+                              on_screenshot=None, stop_event=None):
     """Capture missing frames, trying alternate formats and one URL refresh."""
     if not video:
         return None, "Skipped (None entry)", 0
@@ -276,15 +286,21 @@ def process_video_screenshots(video, output_dir, game_tag="",
     screenshots_taken = 0
     refreshed = False
     for timestamp_sec in missing:
+        if stop_event is not None and stop_event.is_set():
+            return video_id, "Failed (Update cancelled; remaining frames will retry)", screenshots_taken
         output_filename = os.path.join(output_dir, f"{video_id}_{timestamp_sec}s.png")
         while True:
             for stream in streams:
+                if stop_event is not None and stop_event.is_set():
+                    return video_id, "Failed (Update cancelled; remaining frames will retry)", screenshots_taken
                 try:
                     error = capture_screenshot(stream, timestamp_sec, output_filename)
                 except FileNotFoundError:
                     return video_id, "Failed (ffmpeg not found)", screenshots_taken
                 if error is None:
                     screenshots_taken += 1
+                    if on_screenshot is not None:
+                        on_screenshot(Path(output_filename))
                     # Reuse a working fallback for subsequent timestamps.
                     streams = [stream] + [f for f in streams if f is not stream]
                     break
@@ -365,19 +381,24 @@ def youtube_options():
     }
 
 
-def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_relevance=False):
+def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_relevance=False,
+                           *, capture_executor=None, claimed_ids=None, on_screenshot=None,
+                           metadata_file=None, stop_event=None):
     """Discover videos, fetch metadata sequentially, and capture with bounded workers.
 
     The return value indicates whether the source could be processed. Individual
     unavailable/deferred/failed videos are reported and remain eligible for retry.
     """
+    if stop_event is not None and stop_event.is_set():
+        return False
     os.makedirs(output_dir, exist_ok=True)
+    metadata_file = SCREENSHOT_DATA if metadata_file is None else metadata_file
     print(f"Saving screenshots to: {os.path.abspath(output_dir)}")
     try:
-        video_db = load_video_database(SCREENSHOT_DATA)
+        video_db = load_video_database(metadata_file)
         completed_ids = populateHaveSet(output_dir, video_db)
     except (OSError, ValueError) as error:
-        print(f"[ERROR] Could not read {SCREENSHOT_DATA}: {error}")
+        print(f"[ERROR] Could not read {metadata_file}: {error}")
         return False
 
     print(f"Stage 1: Fetching flat video list for source: {channel_url}...")
@@ -389,7 +410,7 @@ def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_re
         'ignoreerrors': True,
     }
     try:
-        with yt_dlp.YoutubeDL(flat_opts) as ydl:
+        with youtube_client(flat_opts) as ydl:
             channel_info = ydl.extract_info(channel_url, download=False)
     except Exception as error:
         print(f"[ERROR] Could not fetch source: {error}")
@@ -429,19 +450,30 @@ def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_re
 
     try:
         # The executor shuts down before ydl, since workers may refresh URLs.
-        with yt_dlp.YoutubeDL(youtube_options()) as ydl, \
-                ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        pool = (nullcontext(capture_executor) if capture_executor is not None
+                else ThreadPoolExecutor(max_workers=MAX_WORKERS))
+        with youtube_client(youtube_options()) as ydl, pool as executor, ExitStack() as cleanup:
+            # Borrowed executors outlive this channel. Finish its workers before
+            # closing the client they use for URL refreshes, including on error.
+            cleanup.callback(wait, pending)
             def fetch_video(url):
                 # Keep extraction sequential, including worker refreshes.
                 with metadata_lock:
                     return ydl.extract_info(url, download=False)
 
             for index, stub in enumerate(videos_to_process, 1):
+                if stop_event is not None and stop_event.is_set():
+                    return False
                 # Do not queue an entire channel's expiring media URLs.
                 if len(pending) >= MAX_WORKERS:
                     done, _ = wait(pending, return_when=FIRST_COMPLETED)
                     report_finished(done)
                 video_id = stub['id']
+                if claimed_ids is not None:
+                    with DB_LOCK:
+                        if video_id in claimed_ids:
+                            continue
+                        claimed_ids.add(video_id)
                 url = stub.get('webpage_url') or stub.get('url')
                 if not url or not url.startswith(('https://', 'http://')):
                     url = f'https://www.youtube.com/watch?v={video_id}'
@@ -470,13 +502,13 @@ def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_re
                         tag.lower() for tag in (info.get('tags') or [])]:
                     counts['skipped'] += 1
                     continue
-                if update_video_database([info], SCREENSHOT_DATA) == (0, 0):
+                if update_video_database([info], metadata_file) == (0, 0):
                     raise OSError(f'Could not save metadata for {video_id}')
 
                 processed = video_db.get(video_id, {}).get('screenshots') or {}
                 future = executor.submit(
                     process_video_screenshots, info, output_dir, game_tag, processed,
-                    lambda video_url=url: fetch_video(video_url))
+                    lambda video_url=url: fetch_video(video_url), on_screenshot, stop_event)
                 pending[future] = video_id
 
             while pending:

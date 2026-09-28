@@ -93,7 +93,7 @@ def get_last_sync_timestamp(conn):
         return None
 
 
-def fetch_battles_from_api(since_timestamp=None):
+def fetch_battles_from_api(since_timestamp=None, stop_event=None):
     """
     Fetches battle data from the API.
     This is a generator, yielding battles one by one to save memory.
@@ -113,15 +113,17 @@ def fetch_battles_from_api(since_timestamp=None):
     
     # This is our pagination loop
     while True:
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError("Replay sync cancelled")
         print(f"Requesting: {API_BASE_URL} with params: {params}")
         try:
-            response = requests.get(API_BASE_URL, params=params)
+            response = requests.get(API_BASE_URL, params=params, timeout=(10, 60))
             # Raise an exception for bad status codes (4xx, 5xx)
             response.raise_for_status() 
             data = response.json()
         except requests.exceptions.RequestException as e:
             print(f"Error fetching from API: {e}")
-            break
+            raise
         # --- END REAL API CALL ---
 
         # --- PARSE THE RESPONSE ---
@@ -136,6 +138,8 @@ def fetch_battles_from_api(since_timestamp=None):
         # Yield each battle individually
         # We sort by the keys as strings to process them in order, just in case
         for battle in battles_dict:
+            if stop_event is not None and stop_event.is_set():
+                raise InterruptedError("Replay sync cancelled")
             
             try:
                 battle_timestamp = battle['startTime']
@@ -260,26 +264,23 @@ def process_and_insert_data(conn, battle_generator):
         print(f"An error occurred during database insertion: {e}")
         print("Rolling back transaction...")
         conn.rollback()
+        raise
     
 
-def main():
+def main(db_name=DB_NAME, stop_event=None):
     """Main function to run the update process."""
     print("--- Starting Database Update Script ---")
     
     # 1. Connect to DB and create tables if they don't exist
-    conn = setup_database(DB_NAME)
+    conn = setup_database(db_name)
     
     # 2. Find out where we left off
-    last_sync = get_last_sync_timestamp(conn)
-    
-    # 3. Get a generator for new battles from the API
-    battle_generator = fetch_battles_from_api(last_sync)
-    
-    # 4. Process all battles from the generator and insert into DB
-    process_and_insert_data(conn, battle_generator)
-    
-    # 5. Close the database connection
-    conn.close()
+    try:
+        last_sync = get_last_sync_timestamp(conn)
+        battle_generator = fetch_battles_from_api(last_sync, stop_event)
+        process_and_insert_data(conn, battle_generator)
+    finally:
+        conn.close()
     print("--- Database Update Script Finished ---")
 
 

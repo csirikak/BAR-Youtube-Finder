@@ -299,10 +299,10 @@ def main():
             videos_data = json.load(f)
     except FileNotFoundError:
         print(f"Error: Could not find '{SCREENSHOT_JSON_FILE}'.")
-        return
+        raise
     except json.JSONDecodeError:
         print(f"Error: Could not parse '{SCREENSHOT_JSON_FILE}'. Check for JSON errors.")
-        return
+        raise
 
     print(f"Loaded {len(videos_data)} videos from '{SCREENSHOT_JSON_FILE}'.")
     
@@ -380,6 +380,7 @@ def main():
     except Exception as e:
         print(f"Error saving to database: {e}")
         conn.rollback()
+        raise
     finally:
         conn.close()
 
