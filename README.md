@@ -12,8 +12,8 @@ The final result is a searchable web frontend that allows you to find videos of 
   * **Replay Database Ingestion**: Pulls all battle replay metadata from the official `api.bar-rts.com` into a local SQLite database.
   * **Custom CV Model**: Includes a complete tool (`bbox.py`) to label, train, and run a YOLO model to detect the in-game player UI panel.
   * **High-Performance OCR**: Uses `RapidOCR` to extract player names from the detected UI panels.
-  * **Fuzzy-Matching Core**: Implements a parallelized, high-speed fuzzy matching algorithm (`rapidfuzz`) to link a list of OCR'd players from a screenshot to a specific battle ID.
-  * **Web Frontend**: Provides a simple, fast, all-client-side search page (`index.html`) to query the final, linked data.
+  * **Incremental Matching**: Uses `rapidfuzz` to link OCR player lists to replays, with a persistent cache that recomputes only videos affected by OCR or replay changes.
+  * **Web Frontend**: A responsive static site with background autocomplete, player/map search, channel and upload-date filters, shareable searches, and paginated video links.
 
 ## How It Works
 
@@ -64,19 +64,26 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 5.  **Match OCR to Replays**:
     `python findScreenshotBattles.py`
 
-      * This is the core logic. It loads the OCR'd player lists from `screenshot_data.json` and the complete battle history from `game_battles.db`.
+      * Reads OCR player lists from `data/screenshot_data.json` and reuses matching results stored in `data/game_battles.db`. Unchanged runs skip loading the battle history entirely.
+      * New OCR results and changes to battles within a video's eight-month search window invalidate that video's cache. Database triggers track replay insertions, corrections, roster edits, and deletions; newer battles leave older uploads cached.
+      * Small updates use an indexed player lookup to load only candidate battles and their rosters. The supporting index is built once, on the first small update.
       * It uses a parallelized process and `rapidfuzz`'s `token_set_ratio` to find the best `battle_id` that matches the list of players in each screenshot.
       * It saves these matches (e.g., "Video X at timestamp Y matches Battle ID Z") into the `battle_videos` table in `game_battles.db` and also creates `matches_output.json`.
+      * Use `--force` to rebuild every match, or `--max-workers 4` to limit worker processes. The first run populates the cache; changing matching settings also invalidates it.
 
 6.  **Export for Frontend**:
     `python exportForFrontend.py`
 
-      * This script reads the final, linked data from the database and `matches_output.json`.
-      * It formats this data into a single, optimized JSON file: `frontend_files/frontend_data.json`.
+      * Reads linked data directly from a consistent SQLite snapshot, with no scraping or OCR needed.
+      * Writes a compact `frontend_files/catalog.<hash>.json`, storing each video and battle once. `frontend_files/frontend_data.json` is now a small manifest pointing to that catalog.
+      * Unchanged catalogs keep the same filename for browser caching. The manifest is replaced atomically after the catalog is ready, and the previous catalog is retained for tabs loading during an update. Deploy the manifest and catalog files together.
 
 7.  **View Results**:
 
-      * Serve the repository folder with a simple HTTP server (e.g., `python -m http.server`) and open `index.html` in your browser. The page will load `frontend_data.json` and provide a search interface.
+      * Serve the repository folder with a simple HTTP server (e.g., `python -m http.server`) and open `index.html` in your browser. Use HTTP rather than opening the file directly: search runs in a module Web Worker.
+      * Data loading, indexing, autocomplete, and filtering run in the worker. The page receives at most eight suggestions or 24 results at a time and loads thumbnails as they approach the viewport.
+      * Player names retain clan tags and Unicode. Search supports case-insensitive names and typo suggestions, with keyboard navigation. Channel, upload-date, sort, and page selections are included in copied search links; existing `?playerName=...` links still work.
+      * The original BAR SVG logo, favicon, Poppins typeface, and blue/charcoal styling are retained. Branding and font files are served locally; asset sources and the font license are in [frontend_files/assets](frontend_files/assets/README.md).
 
 ## Setup & Installation
 
@@ -153,8 +160,15 @@ Use `--no-warp` to leave the current network connection alone, or
 provider is reused; a provider started by this runner is stopped on exit.
 Configure the curated channel list in `update_pipeline.py`.
 
-Scraper, OCR, and update regression tests (no YouTube requests or GPU required):
-`python -m unittest discover -s tests -v`
+Regression tests (no YouTube requests or GPU required):
+
+```bash
+python -m unittest discover -s tests -v
+node --test tests/search.test.mjs
+```
+
+See [performance measurements and cache behavior](docs/performance.md) for
+the update and browser benchmarks, including an optional browser smoke test.
 
 The individual stages can also be run in order:
 
@@ -201,7 +215,10 @@ python -m http.server 8000
 │   └── screenshot_data.json     # (Generated) JSON DB of video metadata and OCR results
 ├── frontend_files/
 │   ├── app.js               # JavaScript for the frontend
-│   ├── frontend_data.json   # (Generated) The final JSON for the UI
+│   ├── frontend_data.json   # (Generated) Small catalog manifest
+│   ├── catalog.<hash>.json  # (Generated) Compact shared data
+│   ├── search-core.js      # Search indexes and pure query logic
+│   ├── search-worker.js    # Background loading, autocomplete, and filtering
 │   └── style.css            # CSS for the frontend
 ├── yolo_dataset/            # (Generated) Staging area for YOLO training
 ├── yolo_labels/             # (Generated) Labels from bbox.py
@@ -209,6 +226,8 @@ python -m http.server 8000
 ├── bbox.py                  # Tool for labeling, training, and inferring with YOLO
 ├── exportForFrontend.py     # Exports final data to frontend_files/frontend_data.json
 ├── findScreenshotBattles.py # **Core Logic**: Matches OCR results to the DB
+├── match_cache.py           # Persistent matching cache and replay change tracking
+├── json_files.py            # Atomic JSON publishing
 ├── index.html               # The web frontend UI
 ├── processScreenshotsRapidOCR.py # Runs YOLO + OCR on all screenshots
 ├── scrape.py                # Scrapes YouTube channels for videos & screenshots

@@ -1,167 +1,85 @@
-import sqlite3
-import json
+"""Export a compact, content-addressed catalog for the static site."""
+
 from collections import defaultdict
+from contextlib import closing
+from datetime import datetime, timezone
+from hashlib import sha256
+import json
+from pathlib import Path
+import sqlite3
 
-# --- CONFIGURATION ---
-DB_NAME = 'data/game_battles.db'
-MATCHES_JSON = 'data/matches_output.json'
-FRONTEND_DATA_OUTPUT = 'frontend_files/frontend_data.json'
+from json_files import write_json
 
-# --- END CONFIGURATION ---
+DB_NAME = "data/game_battles.db"
+MATCHES_JSON = "data/matches_output.json"  # Legacy path; export now reads SQLite directly.
+FRONTEND_DATA_OUTPUT = "frontend_files/frontend_data.json"
 
-def export_data():
-    """
-    Exports all necessary data from the DB and JSON files
-    into a single, client-consumable JSON file.
-    """
-    print(f"Connecting to database: {DB_NAME}")
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
 
-    # 1. Build Player -> Battle ID Index
-    print("Building player index (player_name -> battle_ids)...")
-    print("  -> (Filtering to only include battles with video matches)")
-    player_index = defaultdict(list)
-    
-    # --- UPDATED QUERY ---
-    # This query joins participants with the battle_videos table.
-    # The INNER JOIN ensures that only (player, battle) pairs
-    # are selected where the battle_id *also* exists in battle_videos.
-    # The GROUP BY ensures each battle_id is listed only once per player.
-    filtered_query = """
-        SELECT
-            p.player_name,
-            p.battle_id
-        FROM
-            battle_participants p
-        INNER JOIN
-            battle_videos bv ON p.battle_id = bv.battle_id
-        WHERE
-            p.player_name IS NOT NULL
-        GROUP BY
-            p.player_name, p.battle_id
-    """
-    cursor.execute(filtered_query)
-    
-    for row in cursor.fetchall():
-        player_name, battle_id = row
-        # No 'if' needed, query already filtered
-        player_index[player_name].append(battle_id)
-            
-    # 2. Build Battle -> Video Match Index
-    print("Building battle match index (battle_id -> video_matches)...")
-    battle_matches = defaultdict(list)
-    
-    # This query is unchanged
-    query = """
-        SELECT
-            bv.battle_id,
-            bv.video_id,
-            MIN(bv.video_timestamp_sec) as timestamp,
-            v.title,
-            v.upload_date,
-            v.uploader
+def build_catalog(conn):
+    rows = list(conn.execute("""
+        SELECT bv.battle_id, b.map_name, b.timestamp, bv.video_id,
+               MIN(bv.video_timestamp_sec), v.title, v.upload_date, v.uploader
         FROM battle_videos bv
-        JOIN videos v ON bv.video_id = v.video_id
+        JOIN videos v ON v.video_id = bv.video_id
+        JOIN battles b ON b.battle_id = bv.battle_id
         GROUP BY bv.battle_id, bv.video_id
-    """
-    cursor.execute(query)
-    for row in cursor.fetchall():
-        battle_id, video_id, timestamp, title, upload_date, uploader = row
-        battle_matches[battle_id].append({
-            "video_id": video_id,
-            "timestamp": timestamp,
-            "title": title or "Unknown Title",
-            "upload_date": upload_date or "N/A",
-            "uploader": uploader or "N/A"
-        })
+        ORDER BY bv.battle_id, bv.video_id
+    """))
+    maps = sorted({row[1] for row in rows if row[1]})
+    uploaders = sorted({row[7] or "Unknown channel" for row in rows})
+    map_ids = {name: i for i, name in enumerate(maps)}
+    uploader_ids = {name: i for i, name in enumerate(uploaders)}
+    videos, video_ids, battles, battle_ids = [], {}, [], {}
+    for bid, map_name, date, vid, timestamp, title, uploaded, uploader in rows:
+        if vid not in video_ids:
+            video_ids[vid] = len(videos)
+            videos.append([vid, title or "Untitled video",
+                           uploader_ids[uploader or "Unknown channel"], uploaded or ""])
+        if bid not in battle_ids:
+            battle_ids[bid] = len(battles)
+            battles.append([bid, map_ids.get(map_name, -1), (date or "")[:10], []])
+        battles[battle_ids[bid]][3].append([video_ids[vid], timestamp])
+    players = defaultdict(list)
+    for name, bid in conn.execute("""
+        SELECT p.player_name, p.battle_id FROM battle_participants p
+        JOIN (SELECT DISTINCT battle_id FROM battle_videos) bv ON bv.battle_id = p.battle_id
+        WHERE p.player_name IS NOT NULL AND p.player_name != ''
+        ORDER BY p.player_name, p.battle_id
+    """):
+        if bid in battle_ids:
+            players[name].append(battle_ids[bid])
+    return {"version": 2, "players": dict(players), "battles": battles,
+            "videos": videos, "maps": maps, "uploaders": uploaders}
 
-    # 3. Build Map Index
-    print("Building map index (map_name -> video_matches)...")
-    map_index = defaultdict(list)
-    
-    # This query joins battles (for map_name) with battle_videos and videos
-    # It finds all videos that contain a battle on a specific map.
-    map_query = """
-        SELECT
-            b.map_name,
-            bv.video_id,
-            MIN(bv.video_timestamp_sec) as timestamp,
-            v.title,
-            v.upload_date,
-            v.uploader,
-            bv.battle_id
-        FROM battles b
-        JOIN battle_videos bv ON b.battle_id = bv.battle_id
-        JOIN videos v ON bv.video_id = v.video_id
-        WHERE
-            b.map_name IS NOT NULL
-        GROUP BY b.map_name, bv.video_id, bv.battle_id
-        ORDER BY b.map_name, v.upload_date DESC
-    """
-    cursor.execute(map_query)
-    
-    unique_map_names = set()
-    
-    for row in cursor.fetchall():
-        map_name, video_id, timestamp, title, upload_date, uploader, battle_id = row
-        
-        unique_map_names.add(map_name)
-        
-        map_index[map_name].append({
-            "video_id": video_id,
-            "timestamp": timestamp,
-            "title": title or "Unknown Title",
-            "upload_date": upload_date or "N/A",
-            "uploader": uploader or "N/A",
-            "battle_id": battle_id
-        })
-        
-    conn.close()
-    print("Database processing complete.")
 
-    # 4. Determine most recent battle date from matches
-    #    (The fuzzy OCR search index was removed: it dominated the output
-    #     file size (~300k entries) and was slow to index client-side.
-    #     We still scan matches here only to derive last_battle.)
-    print(f"Loading {MATCHES_JSON} to determine last battle date...")
-    last_battle = 0
-    try:
-        with open(MATCHES_JSON, 'r') as f:
-            matches_data = json.load(f)
-            
-        for video_id, video_info in matches_data.items():
-            upload_date = video_info.get("upload_date", "")
-            if upload_date != "" and int(upload_date) > last_battle:
-                last_battle = int(upload_date)
-                        
-    except Exception as e:
-        print(f"Error processing {MATCHES_JSON}: {e}")
-        return False
-
-    # 5. Compile and save all data
-    print(f"Saving compiled data to {FRONTEND_DATA_OUTPUT}...")
-    
-    all_player_names = list(player_index.keys())
-    all_map_names = sorted(list(unique_map_names))
-    
-    frontend_data = {
-        "player_index": player_index,       # For Search 1 (data)
-        "all_player_names": all_player_names, # For Search 1 (autocomplete)
-        "battle_matches": battle_matches,   # For Search 1 (data)
-        "map_index": map_index,             # For Search 3 (data)
-        "all_map_names": all_map_names,     # For Search 3 (autocomplete)
-        "last_battle": last_battle
-    }
-    
-    with open(FRONTEND_DATA_OUTPUT, 'w') as f:
-        json.dump(frontend_data, f)
-        
-    print("--- Export Complete ---")
-    print(f"Total players indexed: {len(player_index)}")
-    print(f"Total battles with video matches: {len(battle_matches)}")
-    print(f"Total unique maps indexed: {len(all_map_names)}")
+def export_data(*, db_name=DB_NAME, output_file=FRONTEND_DATA_OUTPUT):
+    output = Path(output_file)
+    with closing(sqlite3.connect(Path(db_name).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.execute("BEGIN")  # All exported indexes describe the same snapshot.
+        catalog = build_catalog(conn)
+    payload = json.dumps(catalog, ensure_ascii=False, separators=(",", ":")).encode()
+    filename = f"catalog.{sha256(payload).hexdigest()[:16]}.json"
+    target = output.parent / filename
+    if not target.exists():
+        write_json(target, catalog)
+    stats = {"players": len(catalog["players"]), "battles": len(catalog["battles"]),
+             "videos": len(catalog["videos"]), "maps": len(catalog["maps"])}
+    previous_catalog = None
+    if output.exists():
+        try:
+            previous_catalog = json.loads(output.read_text(encoding="utf-8")).get("catalog")
+        except (ValueError, AttributeError):
+            pass
+    manifest = {"version": 2, "catalog": filename, "bytes": len(payload), "stats": stats,
+                "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    # Publish the manifest last. Keep the previous catalog for already-open tabs.
+    write_json(output, manifest)
+    for old in output.parent.glob("catalog.*.json"):
+        if old.name not in {filename, previous_catalog}:
+            old.unlink()
+    print(f"Frontend export: {stats}; {len(payload):,} bytes in {filename}")
     return True
+
 
 if __name__ == "__main__":
     export_data()

@@ -2,57 +2,87 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BAR Youtube Finder</title>
-    <link rel="icon" type="image/png" href="https://cdn.prod.website-files.com/5c68622246b367adf6f3041d/66db72b254c9b267644377f7_favicon%20(2024).png"/>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
-    
-    <link rel="stylesheet" href="frontend_files/style.css">
-    
-    <script src="https://cdn.jsdelivr.net/npm/fuse.js/dist/fuse.min.js"></script>
-    <script src="frontend_files/app.js" defer></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#1a1a1a">
+    <meta name="description" content="Find Beyond All Reason battles on YouTube. Search players and maps, browse channels, and jump straight to the action.">
+    <title>BAR YouTube Finder</title>
+    <link rel="icon" type="image/png" href="frontend_files/assets/bar-favicon.png">
+    <link rel="preload" href="frontend_files/assets/poppins-latin-400.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="frontend_files/style.css?v=3">
+    <script type="module" src="frontend_files/app.js?v=3"></script>
 </head>
 <body>
-
-    <!-- TOP BAR SECTION -->
-    <div class="top-bar">
-        <span>External Links:</span>
-            <a id="barstats-link" href="http://bar-stats.pro/playerstats" target="_blank" rel="noopener noreferrer" title="See statistics of the BAR playerbase and more!">Barstats</a>
-            <a href="https://gex.honu.pw/" target="_blank" rel="noopener noreferrer" title="Beyond All Reason game extractor.">Gex</a>
-    </div>
-
-    <div class="container">
-        <h1>
-            <img src="https://cdn.prod.website-files.com/5c68622246b367adf6f3041d/66f94bf43835f103fe529d9f_BAR-Beyond-All-Reason-Logo-20-Simple-NoGlow-V2.svg" width="240" alt="" class="logo-img">
-            Youtube Finder
-        </h1>
-        
-        <nav class="tab-nav">
-            <button class="tab-btn active" data-tab="tab-player-search">Search by Player Name</button>
-            <button class="tab-btn" data-tab="tab-map-search">Browse by Map</button>
+    <a class="skip-link" href="#search-input">Skip to search</a>
+    <header class="top-bar">
+        <nav class="external-links" aria-label="Related sites">
+            <span class="external-label">External links:</span>
+            <a id="barstats-link" href="http://bar-stats.pro/playerstats" target="_blank" rel="noopener noreferrer">Barstats <span aria-hidden="true">↗</span></a>
+            <a href="https://gex.honu.pw/" target="_blank" rel="noopener noreferrer">Gex <span aria-hidden="true">↗</span></a>
+            <a href="https://www.beyondallreason.info/replays" target="_blank" rel="noopener noreferrer">BAR replays <span aria-hidden="true">↗</span></a>
         </nav>
+    </header>
+    <main class="container">
+        <header class="page-header">
+            <h1 id="page-title">
+                <a class="logo-link" href="./" aria-label="BAR YouTube Finder home">
+                    <img src="frontend_files/assets/bar-logo.svg" width="240" height="115" alt="Beyond All Reason" class="logo-img">
+                </a>
+                <span>YouTube Finder</span>
+            </h1>
+            <dl class="archive-stats" aria-label="Archive coverage">
+                <div><dt>Players</dt><dd id="stat-players">—</dd></div>
+                <div><dt>Battles</dt><dd id="stat-battles">—</dd></div>
+                <div><dt>Videos</dt><dd id="stat-videos">—</dd></div>
+            </dl>
+        </header>
 
-        <div id="tab-player-search" class="tab-content search-section active">
-            <h2>Search by Player Name</h2>
-            <p>Finds videos associated with a specific, known battle a player was in. (Exact Match)</p>
-            <input type="text" id="player-search" placeholder="Enter exact player name...">
-            <div id="player-autocomplete" class="autocomplete-dropdown"></div>
-            <div id="player-results" class="results"></div>
+        <div class="search-tabs" role="tablist" aria-label="Search by">
+            <button id="player-tab" class="search-tab active" role="tab" aria-selected="true" aria-controls="search-panel" data-kind="player">Search by Player Name</button>
+            <button id="map-tab" class="search-tab" role="tab" aria-selected="false" aria-controls="search-panel" tabindex="-1" data-kind="map">Browse by Map</button>
         </div>
+        <section class="search-panel" id="search-panel" role="tabpanel" aria-labelledby="player-tab">
+            <h2 id="search-heading" class="search-heading">Search by Player Name</h2>
+            <p class="search-tip" id="search-tip">Find videos of battles a player took part in. Choose a name from the suggestions.</p>
+            <form id="search-form" role="search" autocomplete="off">
+                <label id="search-label" class="sr-only" for="search-input">Player name</label>
+                <div class="search-field">
+                    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m16 16 5 5"></path></svg>
+                    <input id="search-input" type="search" placeholder="Enter player name…" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="suggestions" aria-describedby="search-tip" spellcheck="false" maxlength="100">
+                    <button id="clear-search" class="clear-button" type="button" aria-label="Clear search" hidden>×</button>
+                    <button class="search-button" type="submit">Find videos <span aria-hidden="true">→</span></button>
+                    <ul id="suggestions" class="suggestions" role="listbox" aria-label="Search suggestions" hidden></ul>
+                </div>
+            </form>
+            <div class="popular-maps" id="popular-maps" aria-label="Popular maps"></div>
 
-        <div id="tab-map-search" class="tab-content search-section">
-            <h2>Browse by Map</h2>
-            <p>Finds videos of battles played on a specific map.</p>
-            <input type="text" id="map-search" placeholder="Enter map name...">
-            <div id="map-autocomplete" class="autocomplete-dropdown"></div>
-            <div id="map-results" class="results"></div>
-        </div>
-        
-    </div>
-
-    <div id="loading" class="loading-status">Loading Data...</div>
-
+            <section class="browse-section" aria-labelledby="results-title">
+                <div class="browse-heading">
+                    <div><p class="sr-only" id="results-eyebrow">From the archive</p><h2 id="results-title">Recent battles</h2></div>
+                    <button class="quiet-button" id="share-search" type="button">Copy search link <span aria-hidden="true">↗</span></button>
+                </div>
+                <div class="toolbar">
+                    <p id="result-count" class="result-count" role="status" aria-live="polite">Loading the archive…</p>
+                    <div class="filters">
+                        <label><span class="sr-only">Channel</span><select id="channel-filter"><option value="">All channels</option></select></label>
+                        <label><span class="sr-only">Upload date</span><select id="period-filter"><option value="all">Any time</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="365">Last year</option></select></label>
+                        <label><span class="sr-only">Sort order</span><select id="sort-filter"><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label>
+                    </div>
+                </div>
+                <div id="load-status" class="notice" role="status">Loading players and videos…</div>
+                <button id="retry-load" class="quiet-button" type="button" hidden>Retry loading</button>
+                <div id="results" class="results" aria-busy="true"></div>
+                <nav id="pagination" class="pagination" aria-label="Result pages" hidden>
+                    <button id="previous-page" class="page-button" type="button">← Previous</button>
+                    <span id="page-label"></span>
+                    <button id="next-page" class="page-button" type="button">Next →</button>
+                </nav>
+            </section>
+        </section>
+    </main>
+    <footer class="site-footer">
+        <span>An unofficial Beyond All Reason video archive.</span>
+        <span id="last-updated">Matches link you to the moment, and the replay.</span>
+    </footer>
+    <noscript><p class="notice">Enable JavaScript to search this video archive.</p></noscript>
 </body>
 </html>

@@ -5,12 +5,19 @@ from collections import defaultdict
 import concurrent.futures
 import os
 import time
+import argparse
+from contextlib import closing
+from functools import lru_cache
+from pathlib import Path
+
+from json_files import write_json
+from match_cache import digest, ensure_schema, replay_scope_hash
 
 # Use the much faster rapidfuzz library (drop-in replacement for thefuzz)
 # pip install rapidfuzz
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz, __version__ as RAPIDFUZZ_VERSION
 
-# Used for 6-month date calculation
+# Used for the replay date window calculation
 # pip install python-dateutil
 from dateutil.relativedelta import relativedelta
 
@@ -23,15 +30,15 @@ OUTPUT_JSON_FILE = 'data/matches_output.json'
 # (0-100 scale from rapidfuzz)
 MINIMUM_MATCH_THRESHOLD = 50
 
-# Number of processes to use for matching. Defaults to your system's CPU count.
-# Using ProcessPoolExecutor, so this is now # of processes, not threads.
-MAX_WORKERS = 8 #os.cpu_count() or 20
+# Maximum number of processes used for uncached videos.
+MAX_WORKERS = 8
 
 # How far back from the video upload date to search for battles
 MAX_DATE_RANGE_MONTHS = 8
 
 # Mininum number of OCR recognitions to perform a compare.
 MIN_LEN = 6
+CACHE_VERSION = 1  # Bump when matching semantics change.
 
 # --- END CONFIGURATION ---
 
@@ -55,11 +62,12 @@ def init_worker(inverted_index, battle_data):
     print(f"Worker process {os.getpid()} initialized with data.")
 
 
-def load_data_from_db(conn):
+def load_data_from_db(conn, tasks=None):
     """
-    Loads data by fetching battles first, then iterating through
-    all participants once to build both data structures.
+    Load full history for rebuilds, or only possible candidates for small updates.
     """
+    if tasks is not None and len(tasks) <= 200:
+        return load_candidate_data(conn, tasks)
     print("Loading data from database...")
     cursor = conn.cursor()
 
@@ -69,7 +77,7 @@ def load_data_from_db(conn):
     # 1. Load all battle metadata first. This is fast.
     print("  Loading battle metadata...")
     cursor.execute("SELECT battle_id, timestamp FROM battles")
-    for battle_id, timestamp in cursor.fetchall():
+    for battle_id, timestamp in cursor:
         battle_data[battle_id] = {
             'timestamp': timestamp,
             'players': set()  # Initialize with an empty set
@@ -80,7 +88,7 @@ def load_data_from_db(conn):
     cursor.execute("SELECT battle_id, player_name FROM battle_participants")
     
     missing_battles = 0
-    for battle_id, player_name in cursor.fetchall():
+    for battle_id, player_name in cursor:
         if not player_name:
             continue
         
@@ -101,11 +109,63 @@ def load_data_from_db(conn):
     return inverted_index, battle_data
 
 
+def load_candidate_data(conn, tasks):
+    """Use indexed name lookups and date bounds before reading entire rosters."""
+    names, dates = set(), []
+    for _, info in tasks:
+        try:
+            dates.append(datetime.strptime(info.get('upload_date'), '%Y%m%d').date())
+        except (ValueError, TypeError):
+            dates.append(None)
+        for players in info.get('screenshots', {}).values():
+            recognized = {name for name in players if name}
+            if len(recognized) >= MIN_LEN and not any('(AI)' in n or '(Al)' in n for n in recognized):
+                names.update(recognized)
+    inverted_index, battle_data = defaultdict(list), {}
+    if not names:
+        return inverted_index, battle_data
+    # Created once; the covering index avoids scanning millions of unrelated rows.
+    conn.execute('CREATE INDEX IF NOT EXISTS match_participant_names '
+                 'ON battle_participants(player_name, battle_id)')
+    conn.execute('CREATE TEMP TABLE match_names (name TEXT PRIMARY KEY)')
+    conn.executemany('INSERT INTO match_names VALUES (?)', [(name,) for name in sorted(names)])
+    conn.execute('CREATE TEMP TABLE match_candidates (battle_id TEXT PRIMARY KEY)')
+    conn.execute('''INSERT OR IGNORE INTO match_candidates
+        SELECT p.battle_id FROM match_names n
+        CROSS JOIN battle_participants p INDEXED BY match_participant_names
+        ON p.player_name = n.name''')
+    bounded = dates and all(date is not None for date in dates)
+    if bounded:
+        start = min(dates) - relativedelta(months=MAX_DATE_RANGE_MONTHS)
+        end = max(dates)
+    for bid, timestamp in conn.execute('''SELECT b.battle_id, b.timestamp
+            FROM match_candidates c CROSS JOIN battles b ON b.battle_id = c.battle_id'''):
+        if bounded:
+            try:
+                date = datetime.fromisoformat(timestamp.split('.')[0].replace('Z', '')).date()
+                if date < start or date > end:
+                    continue
+            except (ValueError, TypeError, AttributeError):
+                pass  # Match the full matcher's treatment of unknown dates.
+        battle_data[bid] = {'timestamp': timestamp, 'players': set()}
+    conn.execute('DELETE FROM match_candidates')
+    conn.executemany('INSERT INTO match_candidates VALUES (?)', [(bid,) for bid in battle_data])
+    for bid, name in conn.execute('''SELECT p.battle_id, p.player_name
+            FROM match_candidates c CROSS JOIN battle_participants p ON p.battle_id = c.battle_id'''):
+        if name:
+            battle_data[bid]['players'].add(name)
+            if name in names:
+                inverted_index[name].append(bid)
+    conn.execute('DROP TABLE match_candidates')
+    conn.execute('DROP TABLE match_names')
+    print(f'Loaded {len(battle_data)} candidate battles for {len(tasks)} changed videos.')
+    return inverted_index, battle_data
+
+
 def find_best_match(ocr_player_list, video_upload_date_str, inverted_index, battle_data):
     """
     Finds the best battle_id for a given list of OCR'd players.
-    Applies 6-month date filter. Uses raw, case-sensitive strings.
-    (This function is unchanged, as it's just pure logic)
+    Applies the configured date filter. Uses raw, case-sensitive strings.
     """
     
     # Use raw OCR'd names
@@ -186,7 +246,7 @@ def find_best_match(ocr_player_list, video_upload_date_str, inverted_index, batt
     # This is faster and more robust for token_sort_ratio
     ocr_str = " ".join(ocr_player_list)
     
-    for battle_id in valid_candidates:
+    for battle_id in sorted(valid_candidates):
         clean_player_set = battle_data[battle_id]['players']
         clean_player_list = list(clean_player_set)
         
@@ -231,7 +291,6 @@ def process_video_task(task_args):
     # Unpack the lightweight task-specific data
     video_id, video_info = task_args
     
-    print(f"  ... Processing Video: {video_id} (worker {os.getpid()})")
     
     video_db_tuple = (
         video_id,
@@ -282,115 +341,114 @@ def process_video_task(task_args):
     return (video_id, video_db_tuple, matches_db_list, screenshots_json_dict)
 
 
-def main():
-    """Main function to run the matching process."""
-    
-    # 1. Connect to DB and load all data into memory
-    # This is done ONCE in the main thread.
-    conn = sqlite3.connect(DB_NAME)
-    # ***MODIFIED***
-    # Load data into local variables that will be passed to the initializer
-    inverted_index, battle_data = load_data_from_db(conn)
-    conn.close() 
-    
-    # 2. Load the screenshot JSON
-    try:
-        with open(SCREENSHOT_JSON_FILE, 'r') as f:
-            videos_data = json.load(f)
-    except FileNotFoundError:
-        print(f"Error: Could not find '{SCREENSHOT_JSON_FILE}'.")
-        raise
-    except json.JSONDecodeError:
-        print(f"Error: Could not parse '{SCREENSHOT_JSON_FILE}'. Check for JSON errors.")
-        raise
+def main(*, db_name=DB_NAME, screenshot_file=SCREENSHOT_JSON_FILE,
+         output_file=OUTPUT_JSON_FILE, force=False, max_workers=MAX_WORKERS):
+    """Reuse unchanged video matches; recompute only affected replay windows."""
+    if max_workers < 1:
+        raise ValueError("Worker count must be positive")
+    started = time.perf_counter()
+    videos_data = json.loads(Path(screenshot_file).read_text(encoding="utf-8"))
+    if not isinstance(videos_data, dict):
+        raise ValueError("Screenshot metadata must be an object")
+    with closing(sqlite3.connect(db_name, timeout=60)) as conn:
+        ensure_schema(conn)
+        # The updater already waits for replay sync. A consistent transaction also
+        # prevents a standalone writer changing rosters underneath this snapshot.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            revisions = list(conn.execute("SELECT day, revision FROM match_day_revisions ORDER BY day"))
+            cached = {row[0]: row[1:] for row in conn.execute(
+                "SELECT video_id, input_hash, replay_hash, result_json FROM video_match_cache")}
+            settings = [CACHE_VERSION, MIN_LEN, MINIMUM_MATCH_THRESHOLD,
+                        MAX_DATE_RANGE_MONTHS, RAPIDFUZZ_VERSION]
 
-    print(f"Loaded {len(videos_data)} videos from '{SCREENSHOT_JSON_FILE}'.")
-    
-    # This will be our new JSON structure for output
-    output_data = videos_data
-    
-    # Lists to aggregate results from threads
-    all_matches_to_insert = []
-    all_videos_to_insert = []
-    
-    # 3. Process each video and screenshot using a ProcessPool
-    print(f"\n--- Starting parallel processing with {MAX_WORKERS} processes ---")
-    start_time = time.perf_counter()
-    
-    # ***MODIFIED***
-    # Create a list of tasks. Each task is a tuple of arguments
-    # for our process_video_task function.
-    # We now ONLY pass the small, video-specific data.
-    tasks = [
-        (vid, vinfo) 
-        for vid, vinfo in videos_data.items()
-    ]
-    
-    # ***MODIFIED***
-    # Switch to ProcessPoolExecutor
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=MAX_WORKERS,
-        initializer=init_worker,
-        initargs=(inverted_index, battle_data) # Pass large data to initializer
-        
-    ) as executor:
-        
-        # Use executor.map to process tasks in parallel
-        # It returns results in the order the tasks were submitted
-        results = executor.map(process_video_task, tasks)
-        
-        # Process results as they complete
-        for result in results:
-            video_id, video_db_tuple, matches_db_list, screenshots_json_dict = result
-            
-            # Aggregate results safely in the main thread
-            all_videos_to_insert.append(video_db_tuple)
-            all_matches_to_insert.extend(matches_db_list)
-            
-            # Update the main JSON structure
-            if video_id in output_data:
-                output_data[video_id]['screenshots'] = screenshots_json_dict
-    
-    end_time = time.perf_counter()
-    print(f"--- Parallel processing finished in {end_time - start_time:.2f} seconds ---")
-                
-    # 4. Save results to Database
-    print("\n--- Saving all matches to database ---")
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    try:
-        print("Wiping 'battle_videos' table for a clean insert...")
-        cursor.execute("DELETE FROM battle_videos")
-        # Insert all videos
-        cursor.executemany('''
-        INSERT OR REPLACE INTO videos (video_id, upload_date, title, uploader)
-        VALUES (?, ?, ?, ?)
-        ''', all_videos_to_insert)
-        print(f"Inserted or replaced {len(all_videos_to_insert)} video entries.")
-        
-        # Insert all battle/video links
-        cursor.executemany('''
-        INSERT OR REPLACE INTO battle_videos 
-        (battle_id, video_id, video_timestamp_sec, match_score, ocr_player_count, battle_player_count)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ''', all_matches_to_insert)
-        print(f"Inserted or replaced {len(all_matches_to_insert)} screenshot matches.")
-        
-        conn.commit()
-    except Exception as e:
-        print(f"Error saving to database: {e}")
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+            @lru_cache(maxsize=None)
+            def scope(date):
+                return replay_scope_hash(revisions, date, MAX_DATE_RANGE_MONTHS)
 
-    # 5. Save the modified JSON to a new file
-    with open(OUTPUT_JSON_FILE, 'w') as f:
-        json.dump(output_data, f, indent=4)
-        
-    print(f"\n--- Process Complete ---")
-    print(f"Updated JSON with match data saved to '{OUTPUT_JSON_FILE}'.")
+            pending, keys, results = [], {}, {}
+            reused = 0
+            for video_id, info in videos_data.items():
+                key = digest([settings, info.get("upload_date"), info.get("screenshots", {})])
+                replay_key = scope(info.get("upload_date"))
+                keys[video_id] = (key, replay_key)
+                previous = cached.get(video_id)
+                if not force and previous and previous[:2] == (key, replay_key):
+                    try:
+                        result = json.loads(previous[2])
+                        if (not isinstance(result, list) or len(result) != 4
+                                or result[0] != video_id
+                                or not isinstance(result[2], list)
+                                or not isinstance(result[3], dict)):
+                            raise ValueError("Invalid cached result")
+                        results[video_id] = result
+                        reused += 1
+                        continue
+                    except (ValueError, TypeError):
+                        pass  # Rebuild a damaged cache entry from authoritative inputs.
+                pending.append((video_id, info))
+            print(f"Replay matches: {reused} videos cached, {len(pending)} to recompute")
+
+            if pending:
+                inverted_index, battle_data = load_data_from_db(conn, pending)
+                # Small updates finish faster without copying an index to many processes.
+                workers = min(max_workers, max(1, len(pending) // 32))
+                if workers == 1:
+                    init_worker(inverted_index, battle_data)
+                    computed = map(process_video_task, pending)
+                    for result in computed:
+                        results[result[0]] = result
+                else:
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=workers, initializer=init_worker,
+                        initargs=(inverted_index, battle_data)
+                    ) as executor:
+                        for result in executor.map(process_video_task, pending, chunksize=8):
+                            results[result[0]] = result
+
+            # Reconstruct outputs from both reused and new results. This also
+            # removes stale links for removed frames/videos without a full rematch.
+            conn.execute("DELETE FROM battle_videos")
+            all_matches, metadata_rows = [], []
+            output_data = {}
+            for video_id, info in videos_data.items():
+                result = results[video_id]
+                all_matches.extend(result[2])
+                metadata_rows.append((video_id, info.get("upload_date"),
+                                      info.get("title"), info.get("uploader")))
+                output_data[video_id] = dict(info, screenshots=result[3])
+            conn.executemany("""
+                INSERT INTO videos(video_id, upload_date, title, uploader) VALUES (?, ?, ?, ?)
+                ON CONFLICT(video_id) DO UPDATE SET upload_date=excluded.upload_date,
+                title=excluded.title, uploader=excluded.uploader
+            """, metadata_rows)
+            conn.executemany("""
+                INSERT INTO battle_videos
+                (battle_id, video_id, video_timestamp_sec, match_score,
+                 ocr_player_count, battle_player_count) VALUES (?, ?, ?, ?, ?, ?)
+            """, all_matches)
+            for video_id, _ in pending:
+                conn.execute("INSERT OR REPLACE INTO video_match_cache VALUES (?, ?, ?, ?)",
+                             (video_id, *keys[video_id], json.dumps(results[video_id], ensure_ascii=False)))
+            conn.executemany("DELETE FROM video_match_cache WHERE video_id = ?",
+                             [(vid,) for vid in cached if vid not in videos_data])
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    # If publishing fails, the next run can recover from the committed cache.
+    write_json(output_file, output_data, indent=4)
+    summary = {"cached": reused, "computed": len(pending),
+               "matches": len(all_matches), "seconds": time.perf_counter() - started}
+    print(f"Replay matching complete: {summary}")
+    return summary
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Incremental OCR-to-replay matching")
+    parser.add_argument("--db-name", default=DB_NAME)
+    parser.add_argument("--screenshot-file", default=SCREENSHOT_JSON_FILE)
+    parser.add_argument("--output-file", default=OUTPUT_JSON_FILE)
+    parser.add_argument("--max-workers", type=int, default=MAX_WORKERS)
+    parser.add_argument("--force", action="store_true", help="Recompute every match and rebuild the cache")
+    main(**vars(parser.parse_args()))
