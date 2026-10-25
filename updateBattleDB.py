@@ -4,6 +4,11 @@ import time
 import json
 from datetime import datetime, timedelta
 
+import console as ui
+
+
+logger = ui.get("replays")
+
 # --- CONFIGURATION: SET THESE VALUES ---
 
 # The name of your local SQLite database file
@@ -70,7 +75,7 @@ def setup_database(db_name):
     )
     ''')
 
-    print(f"Database '{db_name}' initialized and tables ensured.")
+    logger.debug("Database '%s' initialized and tables ensured", db_name)
     conn.commit()
     return conn
 
@@ -86,10 +91,10 @@ def get_last_sync_timestamp(conn):
     result = cursor.fetchone()
 
     if result and result[0]:
-        print(f"Last sync found. Newest battle is from: {result[0]}")
+        logger.debug("Last sync: newest battle is from %s", result[0])
         return result[0]
     else:
-        print("No previous sync data found. Will perform a full sync.")
+        logger.debug("No previous sync data; performing a full sync")
         return None
 
 
@@ -115,14 +120,14 @@ def fetch_battles_from_api(since_timestamp=None, stop_event=None):
     while True:
         if stop_event is not None and stop_event.is_set():
             raise InterruptedError("Replay sync cancelled")
-        print(f"Requesting: {API_BASE_URL} with params: {params}")
+        logger.debug("Requesting %s with params %s", API_BASE_URL, params)
         try:
             response = requests.get(API_BASE_URL, params=params, timeout=(10, 60))
             # Raise an exception for bad status codes (4xx, 5xx)
             response.raise_for_status() 
             data = response.json()
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching from API: {e}")
+            logger.error("Could not fetch replays: %s", ui.escape(str(e)))
             raise
         # --- END REAL API CALL ---
 
@@ -132,7 +137,7 @@ def fetch_battles_from_api(since_timestamp=None, stop_event=None):
         
         # Stop pagination if the 'data' object is empty
         if not battles_dict:
-            print("No more battles found on this page. Fetch complete.")
+            logger.debug("No more battles on page %d; fetch complete", params['page'])
             break
 
         # Yield each battle individually
@@ -148,24 +153,24 @@ def fetch_battles_from_api(since_timestamp=None, stop_event=None):
                 # If we have a 'since_timestamp' (from a previous run) and this battle
                 # is older or the same, we've seen it. Stop the entire fetch process.
                 if since_timestamp and battle_timestamp and battle_timestamp <= since_timestamp:
-                    print(f"Encountered battle {battle['id']} from {battle_timestamp}, "
-                          "which is at or before our last sync. Stopping fetch.")
+                    logger.debug("Battle %s at %s is not newer than the last sync; stopping",
+                                 battle['id'], battle_timestamp)
                     return  # This stops the generator
                 
                 # --- SYNC LOGIC 2: HISTORICAL LIMIT ---
                 # If we have a 'EARLIEST_BATTLE_TIMESTAMP' (for first sync) and this
                 # battle is older than that, stop the fetch.
                 if EARLIEST_BATTLE_TIMESTAMP and battle_timestamp and battle_timestamp < EARLIEST_BATTLE_TIMESTAMP:
-                    print(f"Encountered battle {battle['id']} from {battle_timestamp}, "
-                          f"which is before the configured earliest date ({EARLIEST_BATTLE_TIMESTAMP}).")
-                    print("Stopping historical sync.")
+                    logger.debug("Battle %s is before the configured earliest date %s; "
+                                 "stopping", battle['id'], EARLIEST_BATTLE_TIMESTAMP)
                     return # This stops the generator
                 
                 # If it's a new battle and within our desired date range, yield it
                 yield battle
 
             except KeyError as e:
-                print(f"Skipping battle due to missing key: {e}. Data: {battle}")
+                logger.debug("Skipping battle with missing key %s: %s", e,
+                             ui.escape(str(battle)))
                 continue
 
 
@@ -202,11 +207,12 @@ def process_and_insert_data(conn, battle_generator):
                 ally_teams = battle.get('AllyTeams', [])
                 
                 if not ally_teams:
-                    print(f"Skipping battle {battle_id} as it has no AllyTeams data.")
+                    logger.debug("Skipping battle %s: no AllyTeams data", battle_id)
                     continue
                     
             except KeyError as e:
-                print(f"Skipping battle due to missing key: {e}. Data: {battle}")
+                logger.debug("Skipping battle with missing key %s: %s", e,
+                             ui.escape(str(battle)))
                 continue
             # --- END EXTRACTION ---
 
@@ -253,35 +259,33 @@ def process_and_insert_data(conn, battle_generator):
 
         # Commit the transaction
         conn.commit()
-        print("\n--- Sync Complete ---")
-        print(f"New battles added: {battles_processed}")
-        print(f"New unique players found: {players_updated}")
-        print(f"New player-battle links created: {links_created}")
-        if battles_processed == 0:
-            print("Database is already up-to-date.")
+        if battles_processed:
+            logger.info("Replay sync · %d new battle(s) · %d new player(s) · %d link(s)",
+                        battles_processed, players_updated, links_created)
+        else:
+            logger.info("Replay sync · database already up to date")
 
     except Exception as e:
-        print(f"An error occurred during database insertion: {e}")
-        print("Rolling back transaction...")
+        logger.error("Database insertion failed; rolling back: %s", ui.escape(str(e)))
         conn.rollback()
         raise
+
+    return {"battles": battles_processed, "players": players_updated,
+            "links": links_created}
     
 
 def main(db_name=DB_NAME, stop_event=None):
-    """Main function to run the update process."""
-    print("--- Starting Database Update Script ---")
-    
+    """Main function to run the update process and return insertion totals."""
     # 1. Connect to DB and create tables if they don't exist
     conn = setup_database(db_name)
-    
+
     # 2. Find out where we left off
     try:
         last_sync = get_last_sync_timestamp(conn)
         battle_generator = fetch_battles_from_api(last_sync, stop_event)
-        process_and_insert_data(conn, battle_generator)
+        return process_and_insert_data(conn, battle_generator)
     finally:
         conn.close()
-    print("--- Database Update Script Finished ---")
 
 
 if __name__ == "__main__":

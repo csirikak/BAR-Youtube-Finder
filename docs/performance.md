@@ -20,6 +20,23 @@ use the process pool. Small batches avoid copying the index to extra processes.
 The working database was also rebuilt and its cache and candidate index populated.
 Its subsequent unchanged run took 0.54 seconds. No new scraping was required.
 
+## OCR concurrency
+
+OCR was measured on an AMD Radeon RX 9070 XT (ROCm) with 12 real screenshots.
+The OCR stage is a sequence of small per-panel detections and recognitions, so
+the GPU was idle between calls even though each call kept it busy. Splitting the
+work across three RapidOCR readers with one CUDA stream each does not change any
+single panel's computation: the saved metadata matched the single-reader run
+exactly (all 12 frames). End-to-end, including model loading and first-call
+kernel setup, the run fell from 11.1 s to 3.2 s; the steady-state gain for large
+batches is about 1.3-1.4x, and three readers break even after a few frames.
+
+Recognition batch size is not the lever. Raising RapidOCR's `Rec.rec_batch_num`
+from 32 to 64/128 changed 1-3 of 913 recognized texts because crops are padded
+to the widest text in each batch, and it did not improve throughput. Keep the
+library's per-panel batching and stat-column crop geometry unchanged; both
+alter or discard otherwise valid names.
+
 ## Cache correctness
 
 Each video's cache key includes its OCR frames, upload date, matching settings,

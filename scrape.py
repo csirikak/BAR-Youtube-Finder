@@ -9,13 +9,19 @@ import math
 import json
 import re
 import tempfile
+import time
 from pathlib import Path
+
+import console as ui
 
 # --- CONFIGURATION ---
 # Max number of videos to download/process in parallel
 MAX_WORKERS = 4
 FFMPEG_TIMEOUT_SEC = 120
 MAX_FORMAT_ATTEMPTS = 3
+# A rejected media URL (403/410) is fixed by re-extracting metadata. Long
+# captures can outlive more than one such rejection.
+MAX_URL_REFRESHES = 3
 # Time of the first screenshot in seconds
 START_TIME_SEC = 90  # 1:30
 # Interval between screenshots in seconds
@@ -28,6 +34,66 @@ FETCH_FROM = "20240601"
 SCREENSHOT_DATA = "data/screenshot_data.json"
 DB_LOCK = threading.Lock()
 YTDLP_INIT_LOCK = threading.Lock()
+
+logger = ui.get("scrape")
+
+
+class YtDlpLogger:
+    """Route yt-dlp's chatty screen output to debug; -v brings it back."""
+
+    def debug(self, message):
+        logger.debug(ui.escape(str(message)))
+
+    def info(self, message):
+        logger.debug(ui.escape(str(message)))
+
+    def warning(self, message):
+        logger.debug(ui.escape(str(message)))
+
+    def error(self, message):
+        logger.debug(ui.escape(str(message)))
+
+
+YTDLP_LOGGER = YtDlpLogger()
+
+
+def source_label(channel_url):
+    """Short, stable name for a channel or search source."""
+    label = channel_url.split('://', 1)[-1]
+    if label.startswith('www.'):
+        label = label[4:]
+    if label.startswith('youtube.com/'):
+        label = label[len('youtube.com/'):]
+    return label.rstrip('/')
+
+
+class IngestionStats:
+    """Counters shared by concurrent sources and capture workers."""
+
+    FIELDS = ("sources", "videos", "processed", "deferred", "skipped",
+              "failed", "frames", "retries", "refreshes", "recovered")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.failures = []
+        for field in self.FIELDS:
+            setattr(self, field, 0)
+
+    def increment(self, field, amount=1):
+        if field not in self.FIELDS:
+            raise ValueError(f"Unknown ingestion counter: {field}")
+        with self.lock:
+            setattr(self, field, getattr(self, field) + amount)
+
+    def record_failure(self, video_id, reason):
+        with self.lock:
+            self.failed += 1
+            self.failures.append((video_id, reason))
+
+    def snapshot(self):
+        with self.lock:
+            counters = {field: getattr(self, field) for field in self.FIELDS}
+            return counters, list(self.failures)
 
 
 def youtube_client(options):
@@ -124,7 +190,7 @@ def update_video_database(video_list, db_filepath='screenshot_data.json'):
             if not isinstance(video_db, dict):
                 raise ValueError(f"'{db_filepath}' is not a JSON object")
         except FileNotFoundError:
-            print(f"No existing database found at '{db_filepath}'. Creating a new one.")
+            logger.debug("No metadata at %s; creating it", db_filepath)
             video_db = {}
 
         updates_count = 0
@@ -169,7 +235,7 @@ def update_video_database(video_list, db_filepath='screenshot_data.json'):
                 json.dump(video_db, f, indent=4, ensure_ascii=False)
             os.replace(temporary_path, db_filepath)
         except IOError as e:
-            print(f"\n[ERROR] Could not write database to '{db_filepath}': {e}")
+            logger.error("Could not write metadata to %s: %s", db_filepath, ui.escape(str(e)))
             # Return 0,0 if save fails
             return (0, 0)
         finally:
@@ -219,6 +285,16 @@ def ffmpeg_error(stderr):
     return '\n'.join(message.strip().splitlines()[-8:])[-2000:]
 
 
+# googlevideo answers a stale or IP/token-bound URL with an auth status, while
+# timeouts and 5XX replies are transport problems that a URL refresh cannot fix.
+REJECTED_URL = re.compile(r'\b(?:401|403|410)\b|forbidden', re.IGNORECASE)
+
+
+def url_rejected(errors):
+    """Whether re-extracting the video could produce usable stream URLs."""
+    return any(REJECTED_URL.search(error) for error in errors)
+
+
 def capture_screenshot(stream, timestamp_sec, output_filename):
     """Publish only a complete PNG; return an error message on capture failure."""
     # A separate file prevents crashes/timeouts from leaving an apparent success.
@@ -257,8 +333,8 @@ def capture_screenshot(stream, timestamp_sec, output_filename):
 
 def process_video_screenshots(video, output_dir, game_tag="",
                               processed_timestamps=(), refresh_video=None,
-                              on_screenshot=None, stop_event=None):
-    """Capture missing frames, trying alternate formats and one URL refresh."""
+                              on_screenshot=None, stop_event=None, stats=None):
+    """Capture missing frames, trying alternate formats and bounded URL refreshes."""
     if not video:
         return None, "Skipped (None entry)", 0
     video_id = video.get('id')
@@ -284,12 +360,14 @@ def process_video_screenshots(video, output_dir, game_tag="",
 
     os.makedirs(output_dir, exist_ok=True)
     screenshots_taken = 0
-    refreshed = False
+    refreshes_left = MAX_URL_REFRESHES
     for timestamp_sec in missing:
         if stop_event is not None and stop_event.is_set():
             return video_id, "Failed (Update cancelled; remaining frames will retry)", screenshots_taken
         output_filename = os.path.join(output_dir, f"{video_id}_{timestamp_sec}s.png")
+        attempts = 0
         while True:
+            failures = []
             for stream in streams:
                 if stop_event is not None and stop_event.is_set():
                     return video_id, "Failed (Update cancelled; remaining frames will retry)", screenshots_taken
@@ -298,26 +376,45 @@ def process_video_screenshots(video, output_dir, game_tag="",
                 except FileNotFoundError:
                     return video_id, "Failed (ffmpeg not found)", screenshots_taken
                 if error is None:
+                    if attempts:
+                        if stats is not None:
+                            stats.increment("recovered")
+                        logger.debug("Recovered %s at %ss after %d failed attempt(s)",
+                                     video_id, timestamp_sec, attempts)
                     screenshots_taken += 1
                     if on_screenshot is not None:
                         on_screenshot(Path(output_filename))
                     # Reuse a working fallback for subsequent timestamps.
                     streams = [stream] + [f for f in streams if f is not stream]
                     break
-                print(f"--- FAILED (ID: {video_id}, {timestamp_sec}s, "
-                      f"format {stream.get('format_id', '?')}): {error}")
+                attempts += 1
+                if stats is not None:
+                    stats.increment("retries")
+                failures.append((stream.get('format_id', '?'), error))
             else:
-                if refresh_video is not None and not refreshed:
-                    refreshed = True
-                    print(f"Refreshing stream URLs for {video_id}...")
+                # Only a rejected URL is worth re-extracting. Retrying the same
+                # frame with fresh URLs recovers an expired or IP-bound stream
+                # without waiting for the next run.
+                if (refresh_video is not None and refreshes_left > 0
+                        and url_rejected(error for _, error in failures)):
+                    refreshes_left -= 1
+                    if stats is not None:
+                        stats.increment("refreshes")
+                    logger.info("[cyan]↻[/cyan] %s: refreshing stream URLs (%d/%d)",
+                                video_id, MAX_URL_REFRESHES - refreshes_left,
+                                MAX_URL_REFRESHES)
                     try:
                         fresh_video = refresh_video()
                         streams = screenshot_formats(fresh_video or {})
                     except Exception as error:
-                        print(f"[WARN] Could not refresh {video_id}: {ffmpeg_error(str(error))}")
+                        logger.warning("Could not refresh %s: %s", video_id,
+                                       ui.escape(ffmpeg_error(str(error))))
                         streams = []
                     if streams:
                         continue
+                for format_id, message in failures:
+                    logger.error("FAILED %s at %ss (format %s): %s", video_id,
+                                 timestamp_sec, format_id, ui.escape(message))
                 remaining = len(missing) - screenshots_taken
                 return video_id, (
                     f"Failed '{video_title}' ({remaining} screenshot(s) still missing; "
@@ -377,13 +474,15 @@ def youtube_options():
         'retries': 2,
         'extractor_retries': 2,
         'noplaylist': True,
-        'quiet': False,
+        'quiet': True,
+        'noprogress': True,
+        'logger': YTDLP_LOGGER,
     }
 
 
 def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_relevance=False,
                            *, capture_executor=None, claimed_ids=None, on_screenshot=None,
-                           metadata_file=None, stop_event=None):
+                           metadata_file=None, stop_event=None, stats=None):
     """Discover videos, fetch metadata sequentially, and capture with bounded workers.
 
     The return value indicates whether the source could be processed. Individual
@@ -391,17 +490,21 @@ def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_re
     """
     if stop_event is not None and stop_event.is_set():
         return False
+    source = ui.escape(source_label(channel_url))
+    started = time.perf_counter()
+    if stats is not None:
+        stats.increment("sources")
     os.makedirs(output_dir, exist_ok=True)
     metadata_file = SCREENSHOT_DATA if metadata_file is None else metadata_file
-    print(f"Saving screenshots to: {os.path.abspath(output_dir)}")
+    logger.debug("Screenshots: %s", os.path.abspath(output_dir))
+    logger.info("[cyan]→[/cyan] %s", source)
     try:
         video_db = load_video_database(metadata_file)
         completed_ids = populateHaveSet(output_dir, video_db)
     except (OSError, ValueError) as error:
-        print(f"[ERROR] Could not read {metadata_file}: {error}")
+        logger.error("Could not read %s: %s", metadata_file, ui.escape(str(error)))
         return False
 
-    print(f"Stage 1: Fetching flat video list for source: {channel_url}...")
     flat_opts = {
         **youtube_options(),
         'extract_flat': 'in_playlist',
@@ -413,10 +516,10 @@ def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_re
         with youtube_client(flat_opts) as ydl:
             channel_info = ydl.extract_info(channel_url, download=False)
     except Exception as error:
-        print(f"[ERROR] Could not fetch source: {error}")
+        logger.error("Could not fetch %s: %s", source, ui.escape(str(error)))
         return False
     if channel_info is None:
-        print("[ERROR] yt-dlp returned no source information.")
+        logger.error("yt-dlp returned no source information for %s", source)
         return False
 
     entries = channel_info.get('entries') if 'entries' in channel_info else [channel_info]
@@ -427,9 +530,11 @@ def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_re
             seen.add(stub['id'])
             videos_to_process.append(stub)
     if not videos_to_process:
-        print("No new or incomplete videos found matching your criteria.")
+        logger.info("[dim]%s · no new or incomplete videos[/dim]", source)
         return True
-    print(f"Stage 1 complete: Found {len(videos_to_process)} new or incomplete videos.")
+    if stats is not None:
+        stats.increment("videos", len(videos_to_process))
+    logger.info("%s · %d new or incomplete video(s)", source, len(videos_to_process))
 
     pending = {}
     counts = {'processed': 0, 'failed': 0, 'deferred': 0, 'skipped': 0, 'screenshots': 0}
@@ -443,10 +548,29 @@ def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_re
                 counts['screenshots'] += count
                 status = message.split(' ', 1)[0].lower()
                 counts[status] += 1
-                print(f"[{status.upper()}] {video_id}: {message}; {count} new screenshot(s)")
+                if stats is not None:
+                    stats.increment("frames", count)
+                    if status == 'failed':
+                        stats.record_failure(video_id, message)
+                    else:
+                        stats.increment(status)
+                if status == 'processed':
+                    logger.info("[green]✓[/green] %s · %s", video_id,
+                                ui.escape(message))
+                elif status == 'deferred':
+                    logger.info("[yellow]…[/yellow] %s · %s", video_id,
+                                ui.escape(message))
+                elif status == 'failed':
+                    logger.error("[red]✗[/red] %s · %s", video_id,
+                                 ui.escape(message))
+                else:
+                    logger.debug("%s · %s", video_id, ui.escape(str(message)))
             except Exception as error:
                 counts['failed'] += 1
-                print(f"[ERROR] Screenshot worker for {video_id}: {error}")
+                if stats is not None:
+                    stats.record_failure(video_id, f"worker error: {error}")
+                logger.error("Screenshot worker for %s: %s", video_id,
+                             ui.escape(str(error)))
 
     try:
         # The executor shuts down before ydl, since workers may refresh URLs.
@@ -477,30 +601,46 @@ def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_re
                 url = stub.get('webpage_url') or stub.get('url')
                 if not url or not url.startswith(('https://', 'http://')):
                     url = f'https://www.youtube.com/watch?v={video_id}'
-                print(f"Fetching metadata {index}/{len(videos_to_process)}: {video_id}")
+                logger.debug("Fetching metadata %d/%d: %s", index,
+                             len(videos_to_process), video_id)
+                if index % 25 == 0:
+                    logger.info("[dim]%s · %d/%d videos scanned[/dim]", source, index,
+                                len(videos_to_process))
                 try:
                     info = fetch_video(url)
                 except yt_dlp.utils.DownloadError as error:
                     counts['failed'] += 1
-                    print(f"[WARN] Metadata fetch failed for {video_id}: {error}")
+                    if stats is not None:
+                        stats.record_failure(video_id, f"metadata: {error}")
+                    logger.warning("Metadata fetch failed for %s: %s", video_id,
+                                   ui.escape(str(error)))
                     continue
                 if not info:
                     counts['failed'] += 1
-                    print(f"[WARN] No metadata for {video_id}; will retry on the next run.")
+                    if stats is not None:
+                        stats.record_failure(video_id, "metadata: no information returned")
+                    logger.warning("No metadata for %s; will retry next run", video_id)
                     continue
                 # Flat playlist entries frequently have no upload_date, so the
                 # date filter must also be checked against full metadata.
                 upload_date = info.get('upload_date')
                 if upload_date and upload_date not in DateRange(start=FETCH_FROM):
                     counts['skipped'] += 1
+                    if stats is not None:
+                        stats.increment("skipped")
                     continue
                 if require_bar_relevance and not is_bar_relevant(info):
                     counts['skipped'] += 1
-                    print(f"[GATE] Skipping non-BAR '{info.get('title', 'N/A')}' ({video_id}).")
+                    if stats is not None:
+                        stats.increment("skipped")
+                    logger.debug("Skipping non-BAR '%s' (%s)",
+                                 ui.escape(str(info.get('title', 'N/A'))), video_id)
                     continue
                 if game_tag and game_tag.lower() not in [
                         tag.lower() for tag in (info.get('tags') or [])]:
                     counts['skipped'] += 1
+                    if stats is not None:
+                        stats.increment("skipped")
                     continue
                 if update_video_database([info], metadata_file) == (0, 0):
                     raise OSError(f'Could not save metadata for {video_id}')
@@ -508,19 +648,22 @@ def get_channel_screenshots(channel_url, output_dir, game_tag="", require_bar_re
                 processed = video_db.get(video_id, {}).get('screenshots') or {}
                 future = executor.submit(
                     process_video_screenshots, info, output_dir, game_tag, processed,
-                    lambda video_url=url: fetch_video(video_url), on_screenshot, stop_event)
+                    lambda video_url=url: fetch_video(video_url), on_screenshot, stop_event,
+                    stats)
                 pending[future] = video_id
 
             while pending:
                 done, _ = wait(pending, return_when=FIRST_COMPLETED)
                 report_finished(done)
     except Exception as error:
-        print(f"[ERROR] Could not process source: {error}")
+        logger.error("Could not process %s: %s", source, ui.escape(str(error)))
         return False
 
-    print(f"Source complete: {counts['screenshots']} new screenshot(s), "
-          f"{counts['processed']} videos completed, {counts['failed']} failed, "
-          f"{counts['deferred']} deferred, {counts['skipped']} skipped.")
+    logger.info(
+        "[green]✓[/green] %s · %d processed · %d frames · %d skipped · "
+        "%d deferred · %d failed · %s", source, counts['processed'],
+        counts['screenshots'], counts['skipped'], counts['deferred'],
+        counts['failed'], ui.duration(time.perf_counter() - started))
     return True
 # --- --- --- --- ---
 #      RUN SCRIPT
@@ -570,4 +713,4 @@ if __name__ == "__main__":
             game_tag="",
             require_bar_relevance=True,
         )
-    print("\nScript finished.")
+    logger.info("Scrape finished")

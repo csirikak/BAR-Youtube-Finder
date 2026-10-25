@@ -49,13 +49,14 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
       * This script reads the list of YouTube channels and uses `yt-dlp` to fetch video metadata (saving to `data/screenshot_data.json`).
       * It uses `ffmpeg` to take screenshots at 1:30 and every 12 minutes thereafter, saving them to `data/AllBarScreenshots/`.
       * Rerunning fills missing timestamps while preserving existing screenshots and OCR results. A video is complete only when every expected timestamp has a complete PNG or a saved OCR result (including an empty player list).
-      * Captures start as metadata arrives, with four concurrent workers. Failed streams try alternate formats and one URL refresh; incomplete captures remain eligible for the next run. The console includes FFmpeg errors and a per-source summary.
+      * Captures start as metadata arrives, with four concurrent workers. Failed streams try alternate formats, and a rejected stream URL (HTTP 401/403/410) is refreshed up to three times per video; recovered frames are reported instead of failed ones, and incomplete captures remain eligible for the next run. The console includes FFmpeg errors for frames that could not be captured and a per-source summary.
       * Ongoing livestreams and videos with only segmented DASH streams are deferred. Rerun after YouTube makes a seekable recording available.
 
 4.  **Run OCR on Screenshots**:
     `python processScreenshotsRapidOCR.py`
 
       * Uses one GPU model instance per stage, batched YOLO panel detection, and PP-OCRv6 through RapidOCR's PyTorch backend. AMD ROCm uses the same `cuda` device interface as NVIDIA. CPU is selected automatically if no GPU is available.
+      * On GPU, three OCR readers run concurrently on separate CUDA streams; recognition results are identical to a single reader but overlap the small per-panel calls. Use `--ocr-workers N` to override (1 on CPU by default).
       * Uses larger recognition batches, skips rotation classification for upright screenshots, and tunes detection for small, dim player names. The local `players` table helps correct unambiguous OCR typos while preserving digits, clan tags, and Unicode names.
       * Updates `data/screenshot_data.json` with atomic checkpoints every 50 frames and at completion/interruption. Completed frames are skipped before models load. Valid empty results are saved; failed frames remain eligible for retry and stop the enclosing pipeline before screenshot cleanup.
       * Override defaults with `--device cpu`, `--device cuda:0`, `--batch-size 4`, or `--checkpoint-every 10`. Use `--reprocess` to replace saved results for screenshots still on disk. Rerun with the same flag if a reprocessing attempt fails.
@@ -103,7 +104,7 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 
 3.  **Install Python Dependencies**
     ```bash
-    pip install -U "yt-dlp[default]" "bgutil-ytdlp-pot-provider>=2.0.0" curl_cffi requests python-dateutil
+    pip install -U "yt-dlp[default]" "bgutil-ytdlp-pot-provider>=2.0.0" curl_cffi requests python-dateutil rich
     pip install opencv-python numpy
     pip install ultralytics "rapidocr==3.9.2" rapidfuzz
     ```
@@ -141,11 +142,14 @@ as they arrive. A shared metadata lock and merged OCR checkpoints preserve both
 new video metadata and recognition results. Duplicate video IDs are claimed once
 per run, and all channels share one bounded capture pool.
 
-The runner prints elapsed time for each stage and total wall time. Concurrent
-stage times include waits and should not be added together. Matching and export
-wait for their inputs; failed prerequisites, exports, or pushes stop cleanup.
-On cancellation, new work stops and in-flight requests finish within their
-timeouts. Successful OCR results remain checkpointed for the next run.
+The runner prints one line per source and per completed video, then a summary
+table of ingestion counters (videos, frames, retries, refreshes, deferred,
+skipped, failed) and stage times, followed by any failed videos with reasons.
+Repeated yt-dlp and per-frame messages only appear with `--verbose`/`-v`.
+Concurrent stage times include waits and should not be added together. Matching
+and export wait for their inputs; failed prerequisites, exports, or pushes stop
+cleanup. On cancellation, new work stops and in-flight requests finish within
+their timeouts. Successful OCR results remain checkpointed for the next run.
 
 ```bash
 # Run the update while retaining screenshots and omitting commit/push.
@@ -153,6 +157,9 @@ python update_pipeline.py --no-publish --keep-screenshots
 
 # Adjust concurrency; defaults shown.
 python update_pipeline.py --channel-workers 2 --capture-workers 4 --ocr-batch-size 8
+
+# Show yt-dlp extraction detail and every recognized frame.
+python update_pipeline.py -v
 ```
 
 Use `--no-warp` to leave the current network connection alone, or

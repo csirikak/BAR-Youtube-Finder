@@ -17,9 +17,13 @@ import time
 from urllib.error import URLError
 from urllib.request import urlopen
 
+import console as ui
 import scrape
 import processScreenshotsRapidOCR as ocr
 import updateBattleDB
+
+
+logger = ui.get("update")
 
 
 ROOT = Path(__file__).resolve().parent
@@ -42,7 +46,7 @@ class StageTimes:
 
     def run(self, name, function, *args, **kwargs):
         start = time.perf_counter()
-        print(f"[update] Starting {name}", flush=True)
+        logger.info("[cyan]▸[/cyan] %s", name)
         try:
             result = function(*args, **kwargs)
             if result is False:
@@ -52,7 +56,7 @@ class StageTimes:
             elapsed = time.perf_counter() - start
             with self.lock:
                 self.seconds[name] = elapsed
-            print(f"[update] {name}: {elapsed:.2f}s elapsed", flush=True)
+            logger.info("[green]✓[/green] %s · %s", name, ui.duration(elapsed))
 
 
 class FrameStream:
@@ -112,7 +116,7 @@ class FrameStream:
 
 
 def scrape_channels(channel_urls, screenshots_dir, metadata_file, stream,
-                    channel_workers=2, capture_workers=4, stop_event=None):
+                    channel_workers=2, capture_workers=4, stop_event=None, stats=None):
     claimed_ids = set()
     failures = []
     try:
@@ -125,7 +129,7 @@ def scrape_channels(channel_urls, screenshots_dir, metadata_file, stream,
                         scrape.get_channel_screenshots, channel, screenshots_dir,
                         capture_executor=captures, claimed_ids=claimed_ids,
                         on_screenshot=stream.put, metadata_file=metadata_file,
-                        stop_event=stop_event
+                        stop_event=stop_event, stats=stats
                     ): channel for channel in channel_urls
                 }
                 for future in as_completed(futures):
@@ -139,10 +143,12 @@ def scrape_channels(channel_urls, screenshots_dir, metadata_file, stream,
 
 
 def run_ingestion(*, channel_urls, screenshots_dir, metadata_file, player_database,
-                  channel_workers=2, capture_workers=4, ocr_batch_size=8, times=None):
+                  channel_workers=2, capture_workers=4, ocr_batch_size=8, times=None,
+                  stats=None, ocr_workers=None):
     if min(channel_workers, capture_workers, ocr_batch_size) < 1:
         raise ValueError("Worker counts and OCR batch size must be positive")
     times = times or StageTimes()
+    stats = stats or scrape.IngestionStats()
     stop_event = threading.Event()
     stream = FrameStream(ocr_batch_size, stop_event=stop_event)
     initial = ocr.load_metadata(metadata_file)
@@ -154,7 +160,8 @@ def run_ingestion(*, channel_urls, screenshots_dir, metadata_file, player_databa
                                  db_name=player_database, stop_event=stop_event)
         capture = stages.submit(
             times.run, "YouTube capture", scrape_channels, channel_urls,
-            screenshots_dir, metadata_file, stream, channel_workers, capture_workers, stop_event
+            screenshots_dir, metadata_file, stream, channel_workers, capture_workers,
+            stop_event, stats
         )
 
         def consume():
@@ -165,7 +172,7 @@ def run_ingestion(*, channel_urls, screenshots_dir, metadata_file, player_databa
                 "OCR", ocr.main, screenshots_dir=screenshots_dir,
                 output_file=metadata_file, player_database=player_database,
                 batch_size=ocr_batch_size, frame_batches=stream.batches(),
-                metadata_lock=scrape.DB_LOCK
+                metadata_lock=scrape.DB_LOCK, ocr_workers=ocr_workers
             )
 
         recognition = stages.submit(consume)
@@ -240,21 +247,30 @@ def publish_changes():
 
 
 def main(*, channel_urls=None, channel_workers=2, capture_workers=4,
-         ocr_batch_size=8, use_warp=True, use_provider=True,
-         publish=True, cleanup=True):
+         ocr_batch_size=8, ocr_workers=None, use_warp=True, use_provider=True,
+         publish=True, cleanup=True, verbose=False):
     if min(channel_workers, capture_workers, ocr_batch_size) < 1:
         raise ValueError("Worker counts and OCR batch size must be positive")
+    ui.setup(verbose)
     started = time.perf_counter()
     times = StageTimes()
+    stats = scrape.IngestionStats()
+    sources = CHANNELS if channel_urls is None else channel_urls
+    ui.banner("BAR update", f"{len(sources)} source{'s' if len(sources) != 1 else ''} · "
+                            f"{channel_workers} channel workers · "
+                            f"{capture_workers} capture workers · OCR batch {ocr_batch_size} · "
+                            f"WARP {'on' if use_warp else 'off'} · PO provider "
+                            f"{'on' if use_provider else 'off'}")
     try:
         with network_services(use_warp, use_provider):
             run_ingestion(
-                channel_urls=CHANNELS if channel_urls is None else channel_urls,
+                channel_urls=sources,
                 screenshots_dir=scrape.SCREENSHOT_DIR,
                 metadata_file=scrape.SCREENSHOT_DATA,
                 player_database=updateBattleDB.DB_NAME,
                 channel_workers=channel_workers, capture_workers=capture_workers,
-                ocr_batch_size=ocr_batch_size, times=times
+                ocr_batch_size=ocr_batch_size, times=times, stats=stats,
+                ocr_workers=ocr_workers
             )
         # A fresh interpreter keeps the matching pool's workers independent of
         # the updater's GPU context and avoids importing its OCR model stack.
@@ -269,15 +285,48 @@ def main(*, channel_urls=None, channel_workers=2, capture_workers=4,
             shutil.rmtree(scrape.SCREENSHOT_DIR)
         return times.seconds
     finally:
-        print(f"[update] Total wall time: {time.perf_counter() - started:.2f}s", flush=True)
-        print("[update] Stage times overlap and include waits; do not add them together.", flush=True)
+        report_summary(stats, times)
+        logger.info("Total wall time %s · stage times overlap, so do not add them",
+                    ui.duration(time.perf_counter() - started))
+
+
+def report_summary(stats, times):
+    """Print run totals after success or failure, without empty tables."""
+    counters, failures = stats.snapshot()
+    if counters["sources"]:
+        rows = [
+            ("Sources", counters["sources"]),
+            ("Videos scanned", counters["videos"]),
+            ("Completed", f"{counters['processed']} video(s)"),
+            ("Frames", f"{counters['frames']:,}"),
+        ]
+        if counters["retries"]:
+            rows.append(("Retries", f"{counters['retries']} attempt(s)"))
+        if counters["refreshes"]:
+            rows.append(("URL refreshes", counters["refreshes"]))
+        if counters["recovered"]:
+            rows.append(("Recovered frames", counters["recovered"]))
+        rows += [
+            ("Deferred", counters["deferred"]),
+            ("Skipped", counters["skipped"]),
+            ("Failed", counters["failed"]),
+        ]
+        ui.stats_table("Ingestion", rows)
+        if failures:
+            ui.failures_table(failures)
+    if times.seconds:
+        ui.stats_table("Stages", [(name, ui.duration(seconds))
+                                  for name, seconds in times.seconds.items()])
 
 
 def cli():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--channel-workers", type=int, default=2)
     parser.add_argument("--capture-workers", type=int, default=4)
     parser.add_argument("--ocr-batch-size", type=int, default=8)
+    parser.add_argument("--ocr-workers", type=int, default=None,
+                        help="parallel OCR readers (default: 3 on GPU, 1 on CPU)")
     parser.add_argument("--no-warp", dest="use_warp", action="store_false")
     parser.add_argument("--no-provider", dest="use_provider", action="store_false")
     parser.add_argument("--no-publish", dest="publish", action="store_false")

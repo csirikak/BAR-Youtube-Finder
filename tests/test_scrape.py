@@ -209,9 +209,51 @@ class ScraperTests(unittest.TestCase):
         self.assertTrue(message.startswith('Failed'))
         self.assertIn('2 screenshot(s) still missing', message)
         self.assertEqual(count, 0)
-        self.assertEqual(capture.call_count, 2)
-        refresh.assert_called_once()
+        self.assertEqual(capture.call_count, scrape.MAX_URL_REFRESHES + 1)
+        self.assertEqual(refresh.call_count, scrape.MAX_URL_REFRESHES)
+        self.assertEqual(self.log.getvalue().count('FAILED'), 1)
         self.assertEqual(scrape.populateHaveSet(self.output, {'example': info}), set())
+
+    def test_recovered_url_rejection_is_not_reported_as_failure(self):
+        info = dict(video(), **stream('expired'))
+        refresh = Mock(return_value=dict(info, **stream('fresh')))
+        stats = scrape.IngestionStats()
+        with patch.object(scrape, 'capture_screenshot',
+                          side_effect=['HTTP 403', None, None]):
+            _, message, count = scrape.process_video_screenshots(
+                info, self.output, refresh_video=refresh, stats=stats)
+        self.assertTrue(message.startswith('Processed'))
+        self.assertEqual(count, 2)
+        counters, _ = stats.snapshot()
+        self.assertEqual(counters['retries'], 1)
+        self.assertEqual(counters['refreshes'], 1)
+        self.assertEqual(counters['recovered'], 1)
+        self.assertNotIn('FAILED', self.log.getvalue())
+
+    def test_rejected_urls_can_be_refreshed_again_later_in_the_video(self):
+        info = dict(video(duration=1530), **stream('expired'))
+        refresh = Mock(side_effect=[
+            dict(info, **stream('fresh-1')), dict(info, **stream('fresh-2'))])
+        with patch.object(scrape, 'capture_screenshot',
+                          side_effect=['HTTP 403', None, 'HTTP 403', None]) as capture:
+            _, message, count = scrape.process_video_screenshots(
+                info, self.output, refresh_video=refresh)
+        self.assertTrue(message.startswith('Processed'))
+        self.assertEqual(count, 2)
+        self.assertEqual(refresh.call_count, 2)
+        self.assertEqual([call.args[0]['format_id'] for call in capture.call_args_list],
+                         ['expired', 'fresh-1', 'fresh-1', 'fresh-2'])
+
+    def test_transport_errors_do_not_burn_url_refreshes(self):
+        info = dict(video(duration=900), **stream())
+        refresh = Mock(return_value=info)
+        with patch.object(scrape, 'capture_screenshot',
+                          return_value='FFmpeg timed out after 120s'):
+            _, message, _ = scrape.process_video_screenshots(
+                info, self.output, refresh_video=refresh)
+        self.assertTrue(message.startswith('Failed'))
+        refresh.assert_not_called()
+        self.assertEqual(self.log.getvalue().count('FAILED'), 1)
 
     def test_partial_success_is_still_reported_as_failed(self):
         info = dict(video(), **stream())

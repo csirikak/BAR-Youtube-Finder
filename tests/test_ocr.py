@@ -98,7 +98,8 @@ class PipelineTests(unittest.TestCase):
             [detection(image) for image in images]
             if isinstance(images, list) else [detection(images)]
         ))
-        self.factory = patch.object(ocr, "create_models", return_value=(self.detector, self.reader)).start()
+        self.factory = patch.object(
+            ocr, "create_engines", return_value=(self.detector, [self.reader])).start()
         self.addCleanup(patch.stopall)
         redirect = contextlib.redirect_stdout(io.StringIO())
         redirect.__enter__()
@@ -123,6 +124,18 @@ class PipelineTests(unittest.TestCase):
         self.factory.assert_called_once()
         self.assertEqual([len(call.args[0]) for call in self.detector.call_args_list], [2, 1])
         self.assertEqual(set(self.saved()["video_id"]["screenshots"]), {"90", "810", "1530"})
+
+    def test_parallel_readers_process_each_frame_once(self):
+        for timestamp in [90, 810, 1530, 2250]:
+            self.frame(timestamp)
+        readers = [Mock(return_value=text_result()) for _ in range(3)]
+        with patch.object(ocr, "create_engines",
+                          return_value=(self.detector, readers)):
+            result = self.run_ocr()
+        self.assertEqual(result, {"processed": 4, "failed": 0})
+        self.assertTrue(all(reader.called for reader in readers))
+        self.assertEqual(set(self.saved()["video_id"]["screenshots"]),
+                         {"90", "810", "1530", "2250"})
 
     def test_completed_empty_results_skip_models(self):
         self.frame(90)
