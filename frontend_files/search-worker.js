@@ -1,4 +1,4 @@
-import {SearchIndex} from './search-core.js';
+import {SearchIndex} from './search-core.js?v=6';
 
 let index;
 self.onmessage = async ({data: message}) => {
@@ -9,7 +9,7 @@ self.onmessage = async ({data: message}) => {
             const manifestResponse = await fetch(new URL('frontend_data.json', import.meta.url), {cache: 'no-cache'});
             if (!manifestResponse.ok) throw new Error('The video index could not be loaded.');
             const manifest = await manifestResponse.json();
-            if (manifest.version !== 2 || !/^catalog\.[a-f0-9]+\.json$/.test(manifest.catalog)) {
+            if (manifest.version !== 4 || !/^catalog\.[a-f0-9]+\.json$/.test(manifest.catalog)) {
                 throw new Error('The video index is being updated. Please retry.');
             }
             const response = await fetch(new URL(manifest.catalog, import.meta.url), {cache: 'force-cache'});

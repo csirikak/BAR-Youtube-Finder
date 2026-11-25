@@ -3,7 +3,6 @@ from contextlib import nullcontext, redirect_stdout
 import io
 import json
 from pathlib import Path
-import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -157,7 +156,9 @@ class UpdateTests(unittest.TestCase):
     def patch_pipeline(self):
         patch.object(update, "network_services", return_value=nullcontext()).start()
         self.ingestion = patch.object(update, "run_ingestion").start()
+        self.twitch_ingestion = patch.object(update, "run_twitch_ingestion").start()
         self.matching = patch.object(update.subprocess, "run").start()
+        self.renames = patch.object(update.rename_resolver, "resolve").start()
         self.export = patch.object(exportForFrontend, "export_data", return_value=True).start()
         self.publish = patch.object(update, "publish_changes").start()
         self.cleanup = patch.object(update.shutil, "rmtree").start()
@@ -166,13 +167,15 @@ class UpdateTests(unittest.TestCase):
     def test_success_preserves_matching_export_publish_cleanup_order(self):
         self.patch_pipeline()
         calls = Mock()
-        for name, function in [("ingest", self.ingestion), ("match", self.matching),
+        for name, function in [("ingest", self.ingestion), ("twitch", self.twitch_ingestion),
+                               ("match", self.matching), ("renames", self.renames),
                                ("export", self.export), ("publish", self.publish),
                                ("cleanup", self.cleanup)]:
             calls.attach_mock(function, name)
         update.main()
         self.assertEqual([call[0] for call in calls.mock_calls],
-                         ["ingest", "match", "export", "publish", "cleanup"])
+                         ["ingest", "twitch", "match", "match", "renames",
+                          "export", "publish", "cleanup", "cleanup"])
         self.assertTrue(self.matching.call_args.kwargs["check"])
 
     def test_failed_prerequisite_prevents_all_downstream_work(self):
@@ -180,7 +183,8 @@ class UpdateTests(unittest.TestCase):
         self.ingestion.side_effect = RuntimeError("failed prerequisite")
         with self.assertRaisesRegex(RuntimeError, "failed prerequisite"):
             update.main()
-        for task in [self.matching, self.export, self.publish, self.cleanup]:
+        for task in [self.twitch_ingestion, self.matching, self.renames,
+                     self.export, self.publish, self.cleanup]:
             task.assert_not_called()
 
     def test_matching_failure_prevents_export_publish_and_cleanup(self):
@@ -188,7 +192,9 @@ class UpdateTests(unittest.TestCase):
         self.matching.side_effect = subprocess.CalledProcessError(1, ["matcher"])
         with self.assertRaises(subprocess.CalledProcessError):
             update.main()
-        for task in [self.export, self.publish, self.cleanup]:
+        self.twitch_ingestion.assert_called_once()
+        self.assertEqual(self.matching.call_count, 1)
+        for task in [self.renames, self.export, self.publish, self.cleanup]:
             task.assert_not_called()
 
     def test_false_export_prevents_publish_and_cleanup(self):
@@ -213,11 +219,54 @@ class UpdateTests(unittest.TestCase):
         self.publish.assert_not_called()
         self.cleanup.assert_not_called()
 
+    def test_twitch_limit_zero_skips_twitch_and_keeps_twitch_screenshots(self):
+        self.patch_pipeline()
+        update.main(twitch_limit=0)
+        self.twitch_ingestion.assert_not_called()
+        self.assertEqual(self.matching.call_count, 1)
+        self.cleanup.assert_called_once_with(update.scrape.SCREENSHOT_DIR)
+
+    def test_twitch_full_population_uses_entire_retention_window(self):
+        self.patch_pipeline()
+        update.main(twitch_full=True)
+        self.twitch_ingestion.assert_called_once()
+        self.assertEqual(self.twitch_ingestion.call_args.kwargs["limit"],
+                         update.scrape_twitch.MAX_VIDEO_PAGE)
+
+    def test_twitch_full_overrides_a_zero_limit(self):
+        self.patch_pipeline()
+        update.main(twitch_limit=0, twitch_full=True)
+        self.twitch_ingestion.assert_called_once()
+
     def test_invalid_limits_fail_before_starting_services(self):
         with patch.object(update, "network_services") as services:
             with self.assertRaises(ValueError):
                 update.main(channel_workers=0)
         services.assert_not_called()
+
+    def test_negative_rename_budget_fails_before_starting_services(self):
+        with patch.object(update, "network_services") as services:
+            with self.assertRaises(ValueError):
+                update.main(rename_requests=-1)
+        services.assert_not_called()
+
+    def test_negative_twitch_limit_fails_before_starting_services(self):
+        with patch.object(update, "network_services") as services:
+            with self.assertRaises(ValueError):
+                update.main(twitch_limit=-1)
+        services.assert_not_called()
+
+    def test_twitch_ingestion_captures_before_ocr(self):
+        with patch.object(update.scrape_twitch, "capture_category") as capture, \
+             patch.object(update.ocr, "main") as recognize:
+            update.run_twitch_ingestion(limit=5, capture_workers=2,
+                                        ocr_batch_size=4)
+        self.assertEqual(capture.call_args.kwargs["limit"], 5)
+        self.assertEqual(capture.call_args.kwargs["workers"], 2)
+        self.assertEqual(recognize.call_args.kwargs["screenshots_dir"],
+                         update.scrape_twitch.SCREENSHOT_DIR)
+        self.assertEqual(recognize.call_args.kwargs["output_file"],
+                         update.scrape_twitch.METADATA_FILE)
 
     def test_owned_network_services_close_on_exception(self):
         process = Mock()

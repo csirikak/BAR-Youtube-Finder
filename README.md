@@ -1,19 +1,22 @@
 # BAR Video Battle Finder
 
-This repository contains a complete pipeline designed to find and link Beyond All Reason (BAR) gameplay moments from YouTube videos to their specific, corresponding battle replays.
+This repository contains a complete pipeline designed to find and link Beyond All Reason (BAR) gameplay moments from YouTube videos and Twitch VODs to their specific, corresponding battle replays.
 
-It works by scraping YouTube channels for BAR content, using computer vision (YOLO) to find player lists in screenshots, performing OCR to extract player names, and then fuzzy-matching those names against a comprehensive SQLite database of all official BAR replays.
+It works by scraping YouTube channels and Twitch category VODs for BAR content, using computer vision (YOLO) to find player lists in screenshots, performing OCR to extract player names, and then fuzzy-matching those names against a comprehensive SQLite database of all official BAR replays.
 
-The final result is a searchable web frontend that allows you to find videos of a specific player or fuzzy-search for a player name and get a direct link to the YouTube video and timestamp where they appeared.
+The final result is a searchable web frontend that allows you to find videos of a specific player or fuzzy-search for a player name and get a direct link to the source video and timestamp where they appeared.
 
 ## Features
 
   * **YouTube Scraper**: Downloads video metadata and screenshots from specified channels using `yt-dlp`.
+  * **Twitch VOD Pipeline**: Discovers recent BAR category VODs, captures frames through yt-dlp + FFmpeg, and stores all Twitch metadata and matches in separate SQL tables.
+  * **60-Day Twitch Retention**: Twitch links older than 60 days are hidden by the frontend and removed from SQL during each Twitch matching update.
   * **Replay Database Ingestion**: Pulls all battle replay metadata from the official `api.bar-rts.com` into a local SQLite database.
   * **Custom CV Model**: Includes a complete tool (`bbox.py`) to label, train, and run a YOLO model to detect the in-game player UI panel.
   * **High-Performance OCR**: Uses `RapidOCR` to extract player names from the detected UI panels.
   * **Incremental Matching**: Uses `rapidfuzz` to link OCR player lists to replays, with a persistent cache that recomputes only videos affected by OCR or replay changes.
-  * **Web Frontend**: A responsive static site with background autocomplete, player/map search, channel and upload-date filters, shareable searches, and paginated video links.
+  * **Rename-Aware Players**: Resolves historical usernames to BAR accounts through [Gex](https://gex.honu.pw/), so searching any previous name returns the same videos.
+  * **Web Frontend**: A responsive static site with background autocomplete, player/map search, channel and upload-date filters, a YouTube/Twitch/both platform filter, shareable searches, and paginated video links.
 
 ## How It Works
 
@@ -36,7 +39,7 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 1.  **Update DB Schema**: (Run once)
     `python updateSchema.py`
 
-      * This adds the `videos` and `battle_videos` tables to the database, which are needed to link replays to videos.
+      * This adds the YouTube `videos`/`battle_videos` tables and the separate Twitch `twitch_videos`/`twitch_battle_videos` tables used to link replays to source videos.
 
 2.  **Populate Replay DB**:
     `python updateBattleDB.py`
@@ -70,21 +73,77 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
       * Small updates use an indexed player lookup to load only candidate battles and their rosters. The supporting index is built once, on the first small update.
       * It uses a parallelized process and `rapidfuzz`'s `token_set_ratio` to find the best `battle_id` that matches the list of players in each screenshot.
       * It saves these matches (e.g., "Video X at timestamp Y matches Battle ID Z") into the `battle_videos` table in `game_battles.db` and also creates `matches_output.json`.
+      * Twitch VODs use the same matching core through `findTwitchBattles.py`, but write only to `twitch_videos` and `twitch_battle_videos`. They are rebuilt from the current Twitch metadata each run, so Twitch IDs never enter the YouTube tables or YouTube cache.
+      * The Twitch matcher applies the 60-day VOD retention window: it deletes expired `twitch_videos`/`twitch_battle_videos` rows before rebuilding the current links.
       * Use `--force` to rebuild every match, or `--max-workers 4` to limit worker processes. The first run populates the cache; changing matching settings also invalidates it.
 
-6.  **Export for Frontend**:
+6.  **Resolve Player Renames**:
+    `python rename_resolver.py`
+
+      * Maps historical player names to stable BAR account IDs through the Gex API. Only names in battles already linked to a video are resolved.
+      * Current usernames come from BAR's user list; historical names use Gex with the required `youtube-finder (discord: cubicleannihilator)` user agent and a conservative 300-requests-per-five-minutes limiter.
+      * Lookups are cached in `player_rename_cache`, so reruns are resumable and repeat runs make no requests for known names. Use `--max-requests N` to bound a run, `--workers N` to overlap requests (default 4), and `--force` to recheck cached names. Ambiguous results are never merged.
+      * The update pipeline runs this stage with a 300-lookup budget after matching; `--rename-requests 0` disables it for a run.
+
+7.  **Export for Frontend**:
     `python exportForFrontend.py`
 
-      * Reads linked data directly from a consistent SQLite snapshot, with no scraping or OCR needed.
-      * Writes a compact `frontend_files/catalog.<hash>.json`, storing each video and battle once. `frontend_files/frontend_data.json` is now a small manifest pointing to that catalog.
+      * Reads linked YouTube and Twitch data directly from a consistent SQLite snapshot, with no scraping or OCR needed.
+      * Writes a compact `frontend_files/catalog.<hash>.json`, storing each video and battle once, with a platform marker and optional thumbnail. `frontend_files/frontend_data.json` is now a small manifest pointing to that catalog.
       * Unchanged catalogs keep the same filename for browser caching. The manifest is replaced atomically after the catalog is ready, and the previous catalog is retained for tabs loading during an update. Deploy the manifest and catalog files together.
 
-7.  **View Results**:
+8.  **View Results**:
 
       * Serve the repository folder with a simple HTTP server (e.g., `python -m http.server`) and open `index.html` in your browser. Use HTTP rather than opening the file directly: search runs in a module Web Worker.
       * Data loading, indexing, autocomplete, and filtering run in the worker. The page receives at most eight suggestions or 24 results at a time and loads thumbnails as they approach the viewport.
-      * Player names retain clan tags and Unicode. Search supports case-insensitive names and typo suggestions, with keyboard navigation. Channel, upload-date, sort, and page selections are included in copied search links; existing `?playerName=...` links still work.
+      * The platform selector switches between all results, YouTube-only results, and Twitch-only results. Twitch VOD links deep-link to the matched timestamp; YouTube links use the existing timestamp URL format. Twitch entries older than 60 days are hidden even if a catalog still contains them.
+      * Player names retain clan tags and Unicode. Search supports case-insensitive names and typo suggestions, with keyboard navigation. Platform, channel, upload-date, sort, and page selections are included in copied search links; existing `?playerName=...` links still work.
       * The original BAR SVG logo, favicon, Poppins typeface, and blue/charcoal styling are retained. Branding and font files are served locally; asset sources and the font license are in [frontend_files/assets](frontend_files/assets/README.md).
+
+## Twitch VODs
+
+`scrape_twitch.py` discovers recent BAR VODs from `https://www.twitch.tv/directory/category/beyond-all-reason/videos/all`. yt-dlp cannot parse Twitch directory pages, so discovery uses the public GQL endpoint behind the category page; each VOD is then resolved with yt-dlp and captured with FFmpeg at the same 1:30 / 12-minute schedule as YouTube videos.
+
+Frames go to `data/TwitchScreenshots/` and metadata to `data/twitch_data.json`, separate from the YouTube archive. Twitch video IDs are prefixed with `twitch_` internally so they cannot collide with YouTube IDs.
+
+Only the last 60 days of Twitch VODs are retained. Discovery requests the full 60-day window rather than stopping at GQL's 100-item page and filters older entries; `findTwitchBattles.py` removes expired Twitch rows from SQL, and the frontend independently hides stale older entries.
+
+```bash
+# List recent BAR category VODs without capturing.
+python scrape_twitch.py --list --limit 10
+
+# Capture the 25 most recent VODs (the pipeline default).
+python scrape_twitch.py --limit 25
+
+# Populate the full 60-day window.
+python scrape_twitch.py --limit 1000
+```
+
+The update pipeline exposes the same full-window request as
+`--twitch-full`, which overrides its usual recent-VOD cap.
+
+```bash
+# OCR the Twitch frames into their separate metadata file.
+python processScreenshotsRapidOCR.py \
+    --screenshots-dir data/TwitchScreenshots \
+    --output-file data/twitch_data.json
+
+# Match the OCR results into the separate Twitch tables.
+python findTwitchBattles.py
+```
+
+The Twitch matcher writes `twitch_videos` and `twitch_battle_videos`; it never touches `videos`, `battle_videos`, or the YouTube matching cache. Export reads both link tables, and the frontend filters by `Both platforms`, `YouTube`, or `Twitch`. Run `findTwitchBattles.py` on every update to refresh links and purge expired Twitch rows.
+
+The original live-capture mode remains available for current streams:
+
+```bash
+# List or capture live BAR streams instead of VODs.
+python scrape_twitch.py --live --list
+python scrape_twitch.py --live --limit 2
+
+# Capture a frame every 12 minutes (Ctrl-C to stop).
+python scrape_twitch.py --live --interval 720
+```
 
 ## Setup & Installation
 
@@ -119,28 +178,44 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 
 ## Usage (Pipeline Order)
 
-For the complete update, run `python update_pipeline.py`. The local
-`update.py` entry point delegates to the same runner. It preserves the existing
-commit/push and screenshot-cleanup steps after a successful update.
+For the complete joint YouTube + Twitch update, run `python update_pipeline.py`.
+The local `update.py` entry point delegates to the same runner. It preserves the
+existing commit/push and screenshot-cleanup steps after a successful update.
+Twitch matching runs automatically and applies the 60-day purge.
+
+For the initial 60-day population, use `--twitch-full`. Discovery already
+filters out VODs older than 60 days; the flag raises the request to Twitch's
+GQL maximum (1000) instead of the recent-update cap:
+
+```bash
+python update_pipeline.py --twitch-full --twitch-capture-workers 4
+```
 
 ```mermaid
 flowchart LR
     Start --> Sync[Replay database sync]
-    Start --> Capture[Two channels / four capture workers total]
+    Start --> Capture[YouTube channel capture]
     Sync --> OCR[Streaming GPU OCR]
     Capture -->|Completed screenshots| OCR
-    Capture --> Match[Replay matching]
+    Capture --> Match[YouTube replay matching]
     OCR --> Match
-    Match --> Export[Frontend export]
+    OCR --> TwitchCapture[Twitch VOD capture]
+    TwitchCapture --> TwitchOCR[Twitch OCR]
+    TwitchOCR --> TwitchMatch[Twitch replay matching]
+    Match --> Renames[Player rename lookup]
+    TwitchMatch --> Renames
+    Renames --> Export[Frontend export]
     Export --> Publish[Commit and push]
     Publish --> Cleanup[Remove processed screenshots]
 ```
 
-Replay sync runs alongside channel discovery and screenshot capture. Once the
-database commits, OCR reads the current player catalog and processes screenshots
-as they arrive. A shared metadata lock and merged OCR checkpoints preserve both
-new video metadata and recognition results. Duplicate video IDs are claimed once
-per run, and all channels share one bounded capture pool.
+Replay sync runs alongside YouTube channel discovery and screenshot capture.
+Once the database commits, OCR reads the current player catalog and processes
+screenshots as they arrive. Twitch VOD capture and OCR run as a separate stage
+after YouTube ingestion, then both matching stages feed rename resolution and
+export. A shared metadata lock and merged OCR checkpoints preserve both new
+video metadata and recognition results. Duplicate YouTube video IDs are claimed
+once per run, and all channels share one bounded capture pool.
 
 The runner prints one line per source and per completed video, then a summary
 table of ingestion counters (videos, frames, retries, refreshes, deferred,
@@ -155,8 +230,15 @@ their timeouts. Successful OCR results remain checkpointed for the next run.
 # Run the update while retaining screenshots and omitting commit/push.
 python update_pipeline.py --no-publish --keep-screenshots
 
-# Adjust concurrency; defaults shown.
-python update_pipeline.py --channel-workers 2 --capture-workers 4 --ocr-batch-size 8
+# Adjust concurrency and Twitch VOD volume; defaults shown.
+python update_pipeline.py --channel-workers 2 --capture-workers 4 \
+    --twitch-limit 25 --twitch-capture-workers 2 --ocr-batch-size 8
+
+# Backfill the entire retained Twitch window (overrides --twitch-limit).
+python update_pipeline.py --twitch-full --twitch-capture-workers 4
+
+# Disable Twitch work and its retention purge for a YouTube-only run.
+python update_pipeline.py --twitch-limit 0
 
 # Show yt-dlp extraction detail and every recognized frame.
 python update_pipeline.py -v
@@ -203,10 +285,13 @@ python processScreenshotsRapidOCR.py
 # 4. Run the matching logic
 python findScreenshotBattles.py
 
-# 5. Export the final data for the website
+# 5. Resolve previous player names (cached and rate-limited)
+python rename_resolver.py
+
+# 6. Export the final data for the website
 python exportForFrontend.py
 
-# 6. Serve the frontend
+# 7. Serve the frontend
 python -m http.server 8000
 # ...then open http://localhost:8000 in your browser
 ```
@@ -216,10 +301,13 @@ python -m http.server 8000
 ```
 .
 ├── data/
-│   ├── AllBarScreenshots/       # (Generated) Directory for all .png screenshots
+│   ├── AllBarScreenshots/       # (Generated) Directory for all YouTube screenshots
+│   ├── TwitchScreenshots/       # (Generated) Directory for all Twitch VOD screenshots
 │   ├── game_battles.db          # (Generated) SQLite DB of all BAR replays
 │   ├── matches_output.json      # (Generated) Intermediate JSON of video/battle matches
-│   └── screenshot_data.json     # (Generated) JSON DB of video metadata and OCR results
+│   ├── screenshot_data.json     # (Generated) JSON DB of video metadata and OCR results
+│   ├── twitch_data.json         # (Generated) Twitch VOD metadata and OCR results
+│   └── twitch_matches.json      # (Generated) Twitch video/battle matches
 ├── frontend_files/
 │   ├── app.js               # JavaScript for the frontend
 │   ├── frontend_data.json   # (Generated) Small catalog manifest
@@ -234,6 +322,10 @@ python -m http.server 8000
 ├── exportForFrontend.py     # Exports final data to frontend_files/frontend_data.json
 ├── findScreenshotBattles.py # **Core Logic**: Matches OCR results to the DB
 ├── match_cache.py           # Persistent matching cache and replay change tracking
+├── rename_resolver.py       # Maps historical names to BAR account IDs
+├── scrape_twitch.py         # Twitch category VOD/live discovery and capture
+├── findTwitchBattles.py     # Twitch-only SQL matching and retention purge
+├── twitch_retention.py      # Shared 60-day Twitch VOD retention rule
 ├── json_files.py            # Atomic JSON publishing
 ├── index.html               # The web frontend UI
 ├── processScreenshotsRapidOCR.py # Runs YOLO + OCR on all screenshots

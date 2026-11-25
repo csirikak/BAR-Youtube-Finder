@@ -2,7 +2,7 @@ const $ = id => document.getElementById(id);
 const input = $('search-input');
 const suggestions = $('suggestions');
 const number = value => Number(value).toLocaleString();
-const state = {kind: 'player', query: '', channel: '', period: 'all', sort: 'newest', page: 1};
+const state = {kind: 'player', query: '', channel: '', period: 'all', platform: 'both', sort: 'newest', page: 1};
 let worker, ready = false, nextId = 0, requestEpoch = 0, suggestionEpoch = 0;
 let debounce, options = [], activeOption = -1, composing = false;
 const pending = new Map();
@@ -65,7 +65,7 @@ async function suggest() {
             option.setAttribute('role', 'option');
             option.setAttribute('aria-selected', 'false');
             option.append(node('span', '', item.name), node('small', '', number(item.count) + ' battles'));
-            option.addEventListener('click', () => selectQuery(item.name));
+            option.addEventListener('click', () => selectQuery(item.query || item.name));
             suggestions.append(option);
         });
         suggestions.hidden = !found.length;
@@ -112,10 +112,12 @@ function readLocation(restore = false) {
     if (restore && !location.search) state.query = stored('lastPlayerQuery');
     state.channel = params.get('channel') || '';
     state.period = ['30', '90', '365'].includes(params.get('period')) ? params.get('period') : 'all';
+    state.platform = ['youtube', 'twitch'].includes(params.get('platform')) ? params.get('platform') : 'both';
     state.sort = params.get('sort') === 'oldest' ? 'oldest' : 'newest';
     state.page = Math.max(1, parseInt(params.get('page'), 10) || 1);
     $('channel-filter').value = state.channel;
     $('period-filter').value = state.period;
+    $('platform-filter').value = state.platform;
     $('sort-filter').value = state.sort;
     updateMode();
 }
@@ -126,6 +128,7 @@ function updateLocation(push = false) {
     else if (state.kind === 'map') params.set('mode', 'map');
     if (state.channel) params.set('channel', state.channel);
     if (state.period !== 'all') params.set('period', state.period);
+    if (state.platform !== 'both') params.set('platform', state.platform);
     if (state.sort !== 'newest') params.set('sort', state.sort);
     if (state.page > 1) params.set('page', String(state.page));
     const url = location.pathname + (params.size ? '?' + params.toString() : '');
@@ -151,6 +154,23 @@ function formatTime(seconds) {
     return hours ? hours + ':' + String(minutes).padStart(2, '0') + ':' + remaining : minutes + ':' + remaining;
 }
 
+function formatTwitchTime(seconds) {
+    seconds = Math.max(0, Math.floor(Number(seconds) || 0));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor(seconds / 60) % 60;
+    return (hours ? hours + 'h' : '') + (minutes ? minutes + 'm' : '')
+        + (seconds % 60) + 's';
+}
+
+function watchUrl(item) {
+    if (item.platform === 'twitch') {
+        return 'https://www.twitch.tv/videos/' + encodeURIComponent(item.videoId)
+            + '?t=' + formatTwitchTime(item.timestamp);
+    }
+    return 'https://www.youtube.com/watch?v=' + encodeURIComponent(item.videoId)
+        + '&t=' + item.timestamp + 's';
+}
+
 function displayDate(value) {
     if (!/^\d{8}$/.test(value)) return 'Date unavailable';
     const iso = value.slice(0, 4) + '-' + value.slice(4, 6) + '-' + value.slice(6, 8);
@@ -161,11 +181,14 @@ function displayDate(value) {
 
 function card(item) {
     const article = node('article', 'video-card');
-    const videoUrl = 'https://www.youtube.com/watch?v=' + encodeURIComponent(item.videoId) + '&t=' + item.timestamp + 's';
+    const videoUrl = watchUrl(item);
+    const platform = item.platform === 'twitch' ? 'Twitch' : 'YouTube';
     const thumb = externalLink('video-thumb', '', videoUrl);
-    thumb.setAttribute('aria-label', 'Watch ' + item.title + ' at ' + formatTime(item.timestamp));
+    thumb.setAttribute('aria-label', 'Watch ' + item.title + ' on ' + platform + ' at ' + formatTime(item.timestamp));
     const image = node('img');
-    image.src = 'https://i.ytimg.com/vi/' + encodeURIComponent(item.videoId) + '/mqdefault.jpg';
+    image.src = item.platform === 'twitch'
+        ? (item.thumbnail || 'frontend_files/assets/bar-favicon.png')
+        : 'https://i.ytimg.com/vi/' + encodeURIComponent(item.videoId) + '/mqdefault.jpg';
     image.alt = '';
     image.loading = 'lazy';
     image.decoding = 'async';
@@ -200,7 +223,7 @@ async function runSearch() {
         state.query = result.query;
         state.page = result.page;
         updateLocation();
-        $('results-title').textContent = state.query || 'Recent battles';
+        $('results-title').textContent = result.displayName || state.query || 'Recent battles';
         $('results-eyebrow').textContent = state.query ? (state.kind === 'player' ? 'PLAYER APPEARANCES' : 'ON THE BATTLEFIELD') : 'FROM THE ARCHIVE';
         $('result-count').textContent = result.count
             ? 'Showing ' + number(result.start + 1) + '–' + number(result.start + result.items.length) + ' of ' + number(result.count) + ' video links'
@@ -220,8 +243,9 @@ async function runSearch() {
         $('page-label').textContent = 'Page ' + result.page + ' of ' + result.pages;
         $('previous-page').disabled = result.page <= 1;
         $('next-page').disabled = result.page >= result.pages;
+        const statName = result.displayName || state.query;
         $('barstats-link').href = 'http://bar-stats.pro/playerstats' +
-            (state.kind === 'player' && state.query ? '?playerName=' + encodeURIComponent(state.query) : '');
+            (state.kind === 'player' && statName ? '?playerName=' + encodeURIComponent(statName) : '');
         $('results').setAttribute('aria-busy', 'false');
     } catch (error) {
         if (epoch === requestEpoch) showError(error);
@@ -248,7 +272,7 @@ async function load() {
     $('load-status').textContent = 'Loading players and videos…';
     $('retry-load').hidden = true;
     try {
-        worker = new Worker(new URL('./search-worker.js', import.meta.url), {type: 'module'});
+        worker = new Worker(new URL('./search-worker.js?v=6', import.meta.url), {type: 'module'});
         worker.onmessage = ({data}) => {
             const task = pending.get(data.id);
             if (!task) return;
@@ -308,7 +332,8 @@ input.addEventListener('keydown', event => {
         active.scrollIntoView({block: 'nearest'});
     } else if (event.key === 'Enter') {
         event.preventDefault();
-        selectQuery(options[activeOption >= 0 ? activeOption : 0].name);
+        const selected = options[activeOption >= 0 ? activeOption : 0];
+        selectQuery(selected.query || selected.name);
     }
 });
 $('search-form').addEventListener('submit', event => { event.preventDefault(); selectQuery(input.value); });
@@ -324,7 +349,7 @@ document.querySelectorAll('[data-kind]').forEach(button => {
         }
     });
 });
-for (const [id, key] of [['channel-filter', 'channel'], ['period-filter', 'period'], ['sort-filter', 'sort']]) {
+for (const [id, key] of [['channel-filter', 'channel'], ['period-filter', 'period'], ['platform-filter', 'platform'], ['sort-filter', 'sort']]) {
     $(id).addEventListener('change', () => { state[key] = $(id).value; state.page = 1; updateLocation(true); runSearch(); });
 }
 for (const [id, direction] of [['previous-page', -1], ['next-page', 1]]) {

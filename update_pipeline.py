@@ -1,4 +1,4 @@
-"""Run replay sync, YouTube capture, and streaming OCR with bounded concurrency."""
+"""Run replay sync, YouTube/Twitch capture, OCR, matching, and export."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,7 +19,9 @@ from urllib.request import urlopen
 
 import console as ui
 import scrape
+import scrape_twitch
 import processScreenshotsRapidOCR as ocr
+import rename_resolver
 import updateBattleDB
 
 
@@ -187,6 +189,25 @@ def run_ingestion(*, channel_urls, screenshots_dir, metadata_file, player_databa
     return times
 
 
+def run_twitch_ingestion(*, limit, capture_workers=2, ocr_batch_size=8,
+                         times=None, stats=None, ocr_workers=None):
+    """Capture category VODs and OCR them into the separate Twitch metadata."""
+    if limit < 1:
+        raise ValueError("Twitch VOD limit must be positive")
+    if capture_workers < 1:
+        raise ValueError("Twitch capture worker count must be positive")
+    times = times or StageTimes()
+    stats = stats or scrape.IngestionStats()
+    times.run("Twitch VOD capture", scrape_twitch.capture_category,
+              limit=limit, workers=capture_workers, stats=stats)
+    times.run("Twitch OCR", ocr.main,
+              screenshots_dir=scrape_twitch.SCREENSHOT_DIR,
+              output_file=scrape_twitch.METADATA_FILE,
+              player_database=updateBattleDB.DB_NAME,
+              batch_size=ocr_batch_size, ocr_workers=ocr_workers)
+    return times
+
+
 def provider_ready():
     try:
         with urlopen("http://127.0.0.1:4416/ping", timeout=1) as response:
@@ -247,10 +268,23 @@ def publish_changes():
 
 
 def main(*, channel_urls=None, channel_workers=2, capture_workers=4,
-         ocr_batch_size=8, ocr_workers=None, use_warp=True, use_provider=True,
-         publish=True, cleanup=True, verbose=False):
+         ocr_batch_size=8, ocr_workers=None, rename_requests=300,
+         twitch_limit=25, twitch_full=False, twitch_capture_workers=2,
+         use_warp=True, use_provider=True, publish=True, cleanup=True,
+         verbose=False):
     if min(channel_workers, capture_workers, ocr_batch_size) < 1:
         raise ValueError("Worker counts and OCR batch size must be positive")
+    if rename_requests < 0:
+        raise ValueError("Rename lookup budget must not be negative")
+    if twitch_limit < 0:
+        raise ValueError("Twitch VOD limit must not be negative")
+    if twitch_full:
+        # Discovery already stops at the 60-day retention cutoff; the GQL
+        # maximum makes the request cover that whole window instead of the
+        # small recent-update cap.
+        twitch_limit = scrape_twitch.MAX_VIDEO_PAGE
+    if twitch_capture_workers < 1:
+        raise ValueError("Twitch capture worker count must be positive")
     ui.setup(verbose)
     started = time.perf_counter()
     times = StageTimes()
@@ -259,6 +293,7 @@ def main(*, channel_urls=None, channel_workers=2, capture_workers=4,
     ui.banner("BAR update", f"{len(sources)} source{'s' if len(sources) != 1 else ''} · "
                             f"{channel_workers} channel workers · "
                             f"{capture_workers} capture workers · OCR batch {ocr_batch_size} · "
+                            f"Twitch VODs {'full 60-day' if twitch_full else (twitch_limit or 'off')} · "
                             f"WARP {'on' if use_warp else 'off'} · PO provider "
                             f"{'on' if use_provider else 'off'}")
     try:
@@ -272,17 +307,34 @@ def main(*, channel_urls=None, channel_workers=2, capture_workers=4,
                 ocr_batch_size=ocr_batch_size, times=times, stats=stats,
                 ocr_workers=ocr_workers
             )
+            if twitch_limit:
+                run_twitch_ingestion(
+                    limit=twitch_limit, capture_workers=twitch_capture_workers,
+                    ocr_batch_size=ocr_batch_size, times=times, stats=stats,
+                    ocr_workers=ocr_workers
+                )
         # A fresh interpreter keeps the matching pool's workers independent of
         # the updater's GPU context and avoids importing its OCR model stack.
         times.run("replay matching", subprocess.run,
                   [sys.executable, str(ROOT / "findScreenshotBattles.py")],
                   cwd=ROOT, check=True)
+        if twitch_limit:
+            times.run("Twitch matching", subprocess.run,
+                      [sys.executable, str(ROOT / "findTwitchBattles.py")],
+                      cwd=ROOT, check=True)
+        times.run("rename lookup", rename_resolver.resolve,
+                  db_name=updateBattleDB.DB_NAME, max_requests=rename_requests)
         from exportForFrontend import export_data
         times.run("frontend export", export_data)
         if publish:
             times.run("Git publish", publish_changes)
-        if cleanup and Path(scrape.SCREENSHOT_DIR).exists():
-            shutil.rmtree(scrape.SCREENSHOT_DIR)
+        if cleanup:
+            directories = [scrape.SCREENSHOT_DIR]
+            if twitch_limit:
+                directories.append(scrape_twitch.SCREENSHOT_DIR)
+            for directory in directories:
+                if Path(directory).exists():
+                    shutil.rmtree(directory)
         return times.seconds
     finally:
         report_summary(stats, times)
@@ -327,6 +379,14 @@ def cli():
     parser.add_argument("--ocr-batch-size", type=int, default=8)
     parser.add_argument("--ocr-workers", type=int, default=None,
                         help="parallel OCR readers (default: 3 on GPU, 1 on CPU)")
+    parser.add_argument("--rename-requests", type=int, default=300,
+                        help="maximum Gex name lookups per update (0 disables)")
+    parser.add_argument("--twitch-limit", type=int, default=25,
+                        help="recent Twitch category VODs per update (0 disables)")
+    parser.add_argument("--twitch-full", action="store_true",
+                        help="capture every available VOD in the 60-day retention "
+                             "window (overrides --twitch-limit)")
+    parser.add_argument("--twitch-capture-workers", type=int, default=2)
     parser.add_argument("--no-warp", dest="use_warp", action="store_false")
     parser.add_argument("--no-provider", dest="use_provider", action="store_false")
     parser.add_argument("--no-publish", dest="publish", action="store_false")
