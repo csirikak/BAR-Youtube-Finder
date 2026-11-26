@@ -4,7 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 
 # Twitch recordings expire, so keeping their links longer only creates dead cards.
-TWITCH_RETENTION_DAYS = 60
+# Fifty days leaves a margin before Twitch removes the recordings themselves.
+TWITCH_RETENTION_DAYS = 50
 
 
 def retention_cutoff(now=None):

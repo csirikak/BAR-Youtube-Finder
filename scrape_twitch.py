@@ -34,8 +34,17 @@ TWITCH_USER_AGENT = "youtube-finder (discord: cubicleannihilator)"
 SCREENSHOT_DIR = "data/TwitchScreenshots"
 METADATA_FILE = "data/twitch_data.json"
 REQUEST_TIMEOUT = (10, 30)
+# Twitch's category feed is capped at roughly 100 results per request. It only
+# lists the last few days of VODs, so channel archives provide the older history.
 MAX_VIDEO_PAGE = 1000
+CHANNEL_VIDEO_PAGE = 100
+CHANNEL_VIDEOS_OPERATION = "FilterableVideoTower_Videos"
+CHANNEL_VIDEOS_HASH = (
+    "67004f7881e65c297936f32c75246470629557a393788fb5a69d6d9a25a8fd5f")
 VOD_PREFIX = "twitch_"
+# Matches can be shorter than YouTube's 12-minute sampling gap, so Twitch VODs
+# are sampled every seven minutes. Existing records keep their stored interval.
+TWITCH_INTERVAL_SEC = 7 * 60
 
 logger = ui.get("twitch")
 
@@ -62,7 +71,7 @@ VIDEOS_QUERY = """
 query CategoryVideos($slug: String!, $first: Int!, $after: Cursor) {
   game(slug: $slug) {
     name
-    videos(first: $first, after: $after) {
+    videos(first: $first, after: $after, types: [ARCHIVE], sort: TIME) {
       pageInfo { hasNextPage endCursor }
       edges {
         node {
@@ -135,20 +144,74 @@ def discover_streams(category_url=CATEGORY_URL, limit=None, session=None):
     return streams
 
 
+def _channel_videos(login, *, slug, since=None, session=None):
+    """Return one channel's archive VODs, including history the category feed omits."""
+    response = (session or requests).post(
+        GQL_URL,
+        headers=_category_headers(VIDEO_CATEGORY_URL),
+        json={
+            "operationName": CHANNEL_VIDEOS_OPERATION,
+            "variables": {
+                "limit": CHANNEL_VIDEO_PAGE,
+                "channelOwnerLogin": login,
+                "broadcastType": "ARCHIVE",
+                "videoSort": "TIME",
+            },
+            "extensions": {"persistedQuery": {
+                "version": 1,
+                "sha256Hash": CHANNEL_VIDEOS_HASH,
+            }},
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    user = ((response.json().get("data") or {}).get("user") or {})
+    page = user.get("videos") or {}
+    videos, seen = [], set()
+    for edge in page.get("edges") or []:
+        node = (edge or {}).get("node") or {}
+        owner = node.get("owner") or {}
+        game = node.get("game") or {}
+        video_id = str(node.get("id") or "")
+        created_at = node.get("publishedAt") or node.get("createdAt")
+        if (not video_id or video_id in seen
+                or game.get("slug") != slug
+                or (since and str(created_at or "").replace("-", "")[:8] < since)):
+            continue
+        seen.add(video_id)
+        videos.append({
+            "video_id": video_id,
+            "title": node.get("title") or "",
+            "duration": int(node.get("lengthSeconds") or 0),
+            "created_at": created_at,
+            "views": int(node.get("viewCount") or 0),
+            "login": owner.get("login") or login,
+            "display_name": owner.get("displayName") or login,
+        })
+    return videos
+
+
 def discover_videos(category_url=VIDEO_CATEGORY_URL, limit=None, since=None,
                     session=None):
-    """Return recent category VODs; request the whole configured window."""
-    target = 100 if limit is None else int(limit)
-    if target < 1:
+    """Return category VODs, then walk active channels back to the cutoff."""
+    requested = None if limit is None else int(limit)
+    if requested is not None and requested < 1:
         return []
+    # A full-window request keeps paging until the cutoff or the last page;
+    # MAX_VIDEO_PAGE is the GQL page size, not a total cap.
+    target = (None if requested is None or requested >= MAX_VIDEO_PAGE
+              else requested)
     videos, seen, after = [], set(), None
-    while len(videos) < target:
-        first = min(MAX_VIDEO_PAGE, target - len(videos))
+    channel_logins = set()
+    while target is None or len(videos) < target:
+        first = (MAX_VIDEO_PAGE if target is None
+                 else min(MAX_VIDEO_PAGE, target - len(videos)))
         game = _gql(category_url, VIDEOS_QUERY, first,
                     after=after, session=session)
         if not game:
             raise ValueError(f"Twitch category not found: {category_slug(category_url)}")
         page = game.get("videos") or {}
+        page_has_recent = False
         for edge in page.get("edges") or []:
             node = (edge or {}).get("node") or {}
             owner = node.get("owner") or {}
@@ -158,7 +221,9 @@ def discover_videos(category_url=VIDEO_CATEGORY_URL, limit=None, since=None,
             created_at = node.get("createdAt")
             if since and str(created_at or "").replace("-", "")[:8] < since:
                 continue
+            page_has_recent = True
             seen.add(video_id)
+            channel_logins.add(owner["login"])
             videos.append({
                 "video_id": video_id,
                 "title": node.get("title") or "",
@@ -168,14 +233,35 @@ def discover_videos(category_url=VIDEO_CATEGORY_URL, limit=None, since=None,
                 "login": owner["login"],
                 "display_name": owner.get("displayName") or owner["login"],
             })
-            if len(videos) >= target:
+            if target is not None and len(videos) >= target:
                 break
         page_info = page.get("pageInfo") or {}
         next_cursor = page_info.get("endCursor")
-        if (len(videos) >= target or not page_info.get("hasNextPage")
+        if ((target is not None and len(videos) >= target)
+                or (since and not page_has_recent)
+                or not page_info.get("hasNextPage")
                 or not next_cursor or next_cursor == after):
             break
         after = next_cursor
+
+    # The category feed only surfaces the last few days. Expand each channel it
+    # found through the retention window so older VODs are not silently lost.
+    if since and target is None and channel_logins:
+        logger.info("Twitch · expanding %d channel archive(s)", len(channel_logins))
+        slug = category_slug(category_url)
+        for login in sorted(channel_logins):
+            try:
+                history = _channel_videos(
+                    login, slug=slug, since=since, session=session)
+            except Exception as error:
+                logger.warning("Twitch · %s history failed: %s",
+                               ui.escape(login), ui.escape(str(error)))
+                continue
+            for video in history:
+                if video["video_id"] in seen:
+                    continue
+                seen.add(video["video_id"])
+                videos.append(video)
     videos.sort(key=lambda video: video.get("created_at") or "", reverse=True)
     return videos
 
@@ -242,6 +328,7 @@ def _normalize_vod(video, info):
     started = _parse_started(video.get("created_at"))
     if started:
         info["upload_date"] = started.strftime("%Y%m%d")
+        info["started_at"] = started.isoformat().replace("+00:00", "Z")
     return info
 
 
@@ -337,10 +424,27 @@ def capture_stream(stream, *, output_dir=SCREENSHOT_DIR,
 
 def capture_vod(video, *, output_dir=SCREENSHOT_DIR,
                 metadata_file=METADATA_FILE, extractor=None, stop_event=None,
-                stats=None):
-    """Capture the normal 90s/12m schedule for one category VOD."""
+                stats=None, on_screenshot=None):
+    """Capture the 90s/5m schedule for one category VOD."""
     video_id = f"{VOD_PREFIX}{video['video_id']}"
-    existing = _load_metadata(metadata_file).get(video_id) or {}
+    stored = _load_metadata(metadata_file)
+    existing = stored.get(video_id) or {}
+    # The GQL creation time is the broadcast start. Backfill it for entries
+    # that predate this field so matching can use the exact stream moment.
+    started = _parse_started(video.get("created_at"))
+    started_at = started.isoformat().replace("+00:00", "Z") if started else None
+    if (started_at and video_id in stored
+            and existing.get("started_at") != started_at):
+        update_metadata(metadata_file, video_id, {"started_at": started_at})
+        existing["started_at"] = started_at
+    # Records captured before per-video intervals existed used 12-minute
+    # sampling; keep that schedule instead of backfilling them all.
+    if existing.get("screenshot_interval_sec"):
+        interval = existing["screenshot_interval_sec"]
+    elif existing.get("screenshots"):
+        interval = scrape.INTERVAL_SEC
+    else:
+        interval = TWITCH_INTERVAL_SEC
     if (existing.get("duration") and not scrape.missing_timestamps(
             dict(existing, id=video_id), output_dir)):
         return {"status": "skipped", "video_id": video_id, "frames": 0,
@@ -353,6 +457,7 @@ def capture_vod(video, *, output_dir=SCREENSHOT_DIR,
     except Exception as error:
         return {"status": "failed", "video_id": video_id, "frames": 0,
                 "message": f"yt-dlp: {error}"}
+    info["screenshot_interval_sec"] = interval
     if not info.get("formats"):
         return {"status": "deferred", "video_id": video_id, "frames": 0,
                 "message": "No seekable video stream available"}
@@ -375,7 +480,7 @@ def capture_vod(video, *, output_dir=SCREENSHOT_DIR,
     _, message, frames = scrape.process_video_screenshots(
         info, output_dir, processed_timestamps=processed,
         refresh_video=lambda: _normalize_vod(video, extractor(video["video_id"])),
-        stop_event=stop_event, stats=stats)
+        on_screenshot=on_screenshot, stop_event=stop_event, stats=stats)
     status = message.split(" ", 1)[0].lower()
     return {"status": status, "video_id": video_id, "frames": frames,
             "message": message}
@@ -383,7 +488,8 @@ def capture_vod(video, *, output_dir=SCREENSHOT_DIR,
 
 def capture_category(*, category_url=VIDEO_CATEGORY_URL, limit=None,
                      output_dir=SCREENSHOT_DIR, metadata_file=METADATA_FILE,
-                     workers=2, stop_event=None, stats=None):
+                     workers=2, stop_event=None, stats=None,
+                     on_screenshot=None):
     """Discover recent category VODs and capture their missing frames."""
     if workers < 1:
         raise ValueError("Worker count must be positive")
@@ -405,7 +511,8 @@ def capture_category(*, category_url=VIDEO_CATEGORY_URL, limit=None,
         try:
             return capture_vod(
                 video, output_dir=output_dir, metadata_file=metadata_file,
-                stop_event=stop_event, stats=stats)
+                stop_event=stop_event, stats=stats,
+                on_screenshot=on_screenshot)
         except Exception as error:
             return {"status": "failed", "video_id": video["video_id"],
                     "frames": 0, "message": f"worker error: {error}"}
@@ -502,8 +609,9 @@ if __name__ == "__main__":
     parser.add_argument("--category-url", default=None)
     parser.add_argument("--output-dir", default=SCREENSHOT_DIR)
     parser.add_argument("--metadata-file", default=METADATA_FILE)
-    parser.add_argument("--limit", type=int, default=25,
-                        help="at most this many recent videos/streams")
+    parser.add_argument("--limit", type=int, default=1000,
+                        help="maximum category results per run (1000/default: "
+                             "walk the full 50-day window)")
     parser.add_argument("--list", dest="list_only", action="store_true",
                         help="list videos/streams without capturing")
     parser.add_argument("--live", action="store_true",

@@ -1,6 +1,6 @@
 // Pure search logic shared by the browser worker and Node regression tests.
 export const normalize = value => String(value).normalize('NFKC').toLowerCase().trim();
-export const TWITCH_RETENTION_DAYS = 60;
+export const TWITCH_RETENTION_DAYS = 50;
 
 function retentionCutoff(now = new Date()) {
     let date = new Date(now);

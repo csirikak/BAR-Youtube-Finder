@@ -10,7 +10,7 @@ The final result is a searchable web frontend that allows you to find videos of 
 
   * **YouTube Scraper**: Downloads video metadata and screenshots from specified channels using `yt-dlp`.
   * **Twitch VOD Pipeline**: Discovers recent BAR category VODs, captures frames through yt-dlp + FFmpeg, and stores all Twitch metadata and matches in separate SQL tables.
-  * **60-Day Twitch Retention**: Twitch links older than 60 days are hidden by the frontend and removed from SQL during each Twitch matching update.
+  * **50-Day Twitch Retention**: Twitch links older than 50 days are hidden by the frontend and removed from SQL during each Twitch matching update.
   * **Replay Database Ingestion**: Pulls all battle replay metadata from the official `api.bar-rts.com` into a local SQLite database.
   * **Custom CV Model**: Includes a complete tool (`bbox.py`) to label, train, and run a YOLO model to detect the in-game player UI panel.
   * **High-Performance OCR**: Uses `RapidOCR` to extract player names from the detected UI panels.
@@ -58,11 +58,11 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 4.  **Run OCR on Screenshots**:
     `python processScreenshotsRapidOCR.py`
 
-      * Uses one GPU model instance per stage, batched YOLO panel detection, and PP-OCRv6 through RapidOCR's PyTorch backend. AMD ROCm uses the same `cuda` device interface as NVIDIA. CPU is selected automatically if no GPU is available.
-      * On GPU, three OCR readers run concurrently on separate CUDA streams; recognition results are identical to a single reader but overlap the small per-panel calls. Use `--ocr-workers N` to override (1 on CPU by default).
+      * Uses batched YOLO panel detection and PP-OCRv6 through RapidOCR's PyTorch backend. AMD ROCm uses the same `cuda` device interface as NVIDIA. CPU is selected automatically if no GPU is available.
+      * On GPU, three OCR readers run on separate streams and overlap with decoding and panel detection for the next batch. Each reader selects the best character scores on the GPU before copying results to the CPU. Use `--ocr-workers N` to override the reader count (1 on CPU by default).
       * Uses larger recognition batches, skips rotation classification for upright screenshots, and tunes detection for small, dim player names. The local `players` table helps correct unambiguous OCR typos while preserving digits, clan tags, and Unicode names.
       * Updates `data/screenshot_data.json` with atomic checkpoints every 50 frames and at completion/interruption. Completed frames are skipped before models load. Valid empty results are saved; failed frames remain eligible for retry and stop the enclosing pipeline before screenshot cleanup.
-      * Override defaults with `--device cpu`, `--device cuda:0`, `--batch-size 4`, or `--checkpoint-every 10`. Use `--reprocess` to replace saved results for screenshots still on disk. Rerun with the same flag if a reprocessing attempt fails.
+      * Override defaults with `--device cpu`, `--device cuda:0`, `--batch-size 4`, or `--checkpoint-every 10`. Use `--reprocess` to replace saved results for screenshots still on disk, or `--reprocess-empty` to revisit only frames whose saved player list is empty. Rerun with the same flag if a reprocessing attempt fails.
       * For an isolated evaluation: `python processScreenshotsRapidOCR.py --screenshots-dir path/to/samples --output-file data/ocr-evaluation.json`. See [OCR benchmark results](docs/ocr-benchmark.md) for the model comparison and limitations.
 
 5.  **Match OCR to Replays**:
@@ -74,7 +74,7 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
       * It uses a parallelized process and `rapidfuzz`'s `token_set_ratio` to find the best `battle_id` that matches the list of players in each screenshot.
       * It saves these matches (e.g., "Video X at timestamp Y matches Battle ID Z") into the `battle_videos` table in `game_battles.db` and also creates `matches_output.json`.
       * Twitch VODs use the same matching core through `findTwitchBattles.py`, but write only to `twitch_videos` and `twitch_battle_videos`. They are rebuilt from the current Twitch metadata each run, so Twitch IDs never enter the YouTube tables or YouTube cache.
-      * The Twitch matcher applies the 60-day VOD retention window: it deletes expired `twitch_videos`/`twitch_battle_videos` rows before rebuilding the current links.
+      * The Twitch matcher applies the 50-day VOD retention window: it deletes expired `twitch_videos`/`twitch_battle_videos` rows before rebuilding the current links.
       * Use `--force` to rebuild every match, or `--max-workers 4` to limit worker processes. The first run populates the cache; changing matching settings also invalidates it.
 
 6.  **Resolve Player Renames**:
@@ -96,31 +96,30 @@ Once you have a trained `ui_detector.pt` model, you can run the main pipeline.
 
       * Serve the repository folder with a simple HTTP server (e.g., `python -m http.server`) and open `index.html` in your browser. Use HTTP rather than opening the file directly: search runs in a module Web Worker.
       * Data loading, indexing, autocomplete, and filtering run in the worker. The page receives at most eight suggestions or 24 results at a time and loads thumbnails as they approach the viewport.
-      * The platform selector switches between all results, YouTube-only results, and Twitch-only results. Twitch VOD links deep-link to the matched timestamp; YouTube links use the existing timestamp URL format. Twitch entries older than 60 days are hidden even if a catalog still contains them.
+      * The platform selector switches between all results, YouTube-only results, and Twitch-only results. Twitch VOD links deep-link to the matched timestamp; YouTube links use the existing timestamp URL format. Twitch entries older than 50 days are hidden even if a catalog still contains them.
       * Player names retain clan tags and Unicode. Search supports case-insensitive names and typo suggestions, with keyboard navigation. Platform, channel, upload-date, sort, and page selections are included in copied search links; existing `?playerName=...` links still work.
       * The original BAR SVG logo, favicon, Poppins typeface, and blue/charcoal styling are retained. Branding and font files are served locally; asset sources and the font license are in [frontend_files/assets](frontend_files/assets/README.md).
 
 ## Twitch VODs
 
-`scrape_twitch.py` discovers recent BAR VODs from `https://www.twitch.tv/directory/category/beyond-all-reason/videos/all`. yt-dlp cannot parse Twitch directory pages, so discovery uses the public GQL endpoint behind the category page; each VOD is then resolved with yt-dlp and captured with FFmpeg at the same 1:30 / 12-minute schedule as YouTube videos.
+`scrape_twitch.py` discovers recent BAR VODs from `https://www.twitch.tv/directory/category/beyond-all-reason/videos/all`. yt-dlp cannot parse Twitch directory pages, so discovery uses the public GQL endpoint behind the category page; each VOD is then resolved with yt-dlp and captured with FFmpeg starting at 1:30 and sampled every 7 minutes, since matches can be shorter than YouTube's 12-minute gap. VODs captured before the 7-minute schedule keep their original interval, so changing it does not backfill the archive.
 
 Frames go to `data/TwitchScreenshots/` and metadata to `data/twitch_data.json`, separate from the YouTube archive. Twitch video IDs are prefixed with `twitch_` internally so they cannot collide with YouTube IDs.
 
-Only the last 60 days of Twitch VODs are retained. Discovery requests the full 60-day window rather than stopping at GQL's 100-item page and filters older entries; `findTwitchBattles.py` removes expired Twitch rows from SQL, and the frontend independently hides stale older entries.
+Only the last 50 days of Twitch VODs are retained. The category feed only exposes the last few days, so discovery uses it to find active channels and then walks each channel's archive back to the 50-day cutoff, keeping only Beyond All Reason VODs. Channels with no recent category VOD cannot be discovered from that feed. `findTwitchBattles.py` removes expired Twitch rows from SQL, and the frontend independently hides stale older entries.
+
+Twitch matching places each screenshot in real time from the VOD's broadcast start plus the screenshot timestamp, then considers only battles within ±12 hours of that moment.
 
 ```bash
 # List recent BAR category VODs without capturing.
 python scrape_twitch.py --list --limit 10
 
-# Capture the 25 most recent VODs (the pipeline default).
-python scrape_twitch.py --limit 25
-
-# Populate the full 60-day window.
+# Capture every VOD in the 50-day window (the default).
 python scrape_twitch.py --limit 1000
 ```
 
-The update pipeline exposes the same full-window request as
-`--twitch-full`, which overrides its usual recent-VOD cap.
+The update pipeline requests the full 50-day window by default.
+`--twitch-full` remains an explicit alias; use `--twitch-limit N` for a smaller cap.
 
 ```bash
 # OCR the Twitch frames into their separate metadata file.
@@ -181,11 +180,10 @@ python scrape_twitch.py --live --interval 720
 For the complete joint YouTube + Twitch update, run `python update_pipeline.py`.
 The local `update.py` entry point delegates to the same runner. It preserves the
 existing commit/push and screenshot-cleanup steps after a successful update.
-Twitch matching runs automatically and applies the 60-day purge.
+Twitch matching runs automatically and applies the 50-day purge.
 
-For the initial 60-day population, use `--twitch-full`. Discovery already
-filters out VODs older than 60 days; the flag raises the request to Twitch's
-GQL maximum (1000) instead of the recent-update cap:
+The default already requests every VOD in the 50-day window. `--twitch-full`
+remains an explicit alias for the GQL maximum (1000):
 
 ```bash
 python update_pipeline.py --twitch-full --twitch-capture-workers 4
@@ -217,9 +215,11 @@ export. A shared metadata lock and merged OCR checkpoints preserve both new
 video metadata and recognition results. Duplicate YouTube video IDs are claimed
 once per run, and all channels share one bounded capture pool.
 
-The runner prints one line per source and per completed video, then a summary
-table of ingestion counters (videos, frames, retries, refreshes, deferred,
-skipped, failed) and stage times, followed by any failed videos with reasons.
+The runner prints one line per source and per completed video, then summary
+tables for ingestion counters (videos, frames, retries, refreshes, deferred,
+skipped, failed), captured screenshot resolutions for YouTube and Twitch
+(4K, 2K, 1080p, 720p, 480p, other), and stage times, followed by any failed
+videos with reasons.
 Repeated yt-dlp and per-frame messages only appear with `--verbose`/`-v`.
 Concurrent stage times include waits and should not be added together. Matching
 and export wait for their inputs; failed prerequisites, exports, or pushes stop
@@ -232,9 +232,9 @@ python update_pipeline.py --no-publish --keep-screenshots
 
 # Adjust concurrency and Twitch VOD volume; defaults shown.
 python update_pipeline.py --channel-workers 2 --capture-workers 4 \
-    --twitch-limit 25 --twitch-capture-workers 2 --ocr-batch-size 8
+    --twitch-limit 1000 --twitch-capture-workers 2 --ocr-batch-size 8
 
-# Backfill the entire retained Twitch window (overrides --twitch-limit).
+# Explicitly request the entire retained Twitch window (the default).
 python update_pipeline.py --twitch-full --twitch-capture-workers 4
 
 # Disable Twitch work and its retention purge for a YouTube-only run.
@@ -325,7 +325,7 @@ python -m http.server 8000
 ├── rename_resolver.py       # Maps historical names to BAR account IDs
 ├── scrape_twitch.py         # Twitch category VOD/live discovery and capture
 ├── findTwitchBattles.py     # Twitch-only SQL matching and retention purge
-├── twitch_retention.py      # Shared 60-day Twitch VOD retention rule
+├── twitch_retention.py      # Shared 50-day Twitch VOD retention rule
 ├── json_files.py            # Atomic JSON publishing
 ├── index.html               # The web frontend UI
 ├── processScreenshotsRapidOCR.py # Runs YOLO + OCR on all screenshots

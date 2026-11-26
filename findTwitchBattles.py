@@ -24,6 +24,8 @@ DB_NAME = "data/game_battles.db"
 SCREENSHOT_FILE = "data/twitch_data.json"
 OUTPUT_JSON_FILE = "data/twitch_matches.json"
 MAX_WORKERS = 4
+# A screenshot can only show a battle happening around that point in the VOD.
+MATCH_WINDOW_HOURS = 12
 
 
 def _load_videos(filename):
@@ -72,17 +74,20 @@ def main(*, db_name=DB_NAME, screenshot_file=SCREENSHOT_FILE,
         try:
             purged = purge_expired_twitch_videos(conn, cutoff)
             if tasks:
-                inverted_index, battle_data = matching.load_data_from_db(conn, tasks)
+                inverted_index, battle_data = matching.load_data_from_db(
+                    conn, tasks, match_window_hours=MATCH_WINDOW_HOURS)
                 workers = min(max_workers, max(1, len(tasks) // 32))
                 if workers == 1:
-                    matching.init_worker(inverted_index, battle_data)
+                    matching.init_worker(
+                        inverted_index, battle_data, MATCH_WINDOW_HOURS)
                     results = map(matching.process_video_task, tasks)
                     results = list(results)
                 else:
                     with concurrent.futures.ProcessPoolExecutor(
                             max_workers=workers,
                             initializer=matching.init_worker,
-                            initargs=(inverted_index, battle_data)) as executor:
+                            initargs=(inverted_index, battle_data,
+                                      MATCH_WINDOW_HOURS)) as executor:
                         results = list(executor.map(
                             matching.process_video_task, tasks, chunksize=8))
             else:

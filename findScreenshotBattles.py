@@ -1,6 +1,6 @@
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import concurrent.futures
 import os
@@ -48,26 +48,41 @@ CACHE_VERSION = 1  # Bump when matching semantics change.
 # to avoid passing large data with every task.
 g_inverted_index = None
 g_battle_data = None
+g_match_window_hours = None
 
 
-def init_worker(inverted_index, battle_data):
+def _parse_utc(value):
+    """Parse an ISO timestamp into naive UTC for comparisons."""
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("empty timestamp")
+    parsed = datetime.fromisoformat(text.split(".")[0].replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def init_worker(inverted_index, battle_data, match_window_hours=None):
     """
     Initializer for each worker process.
     This runs ONCE per process, loading the large read-only
     data into the process's global scope.
     """
-    global g_inverted_index, g_battle_data
+    global g_inverted_index, g_battle_data, g_match_window_hours
     g_inverted_index = inverted_index
     g_battle_data = battle_data
+    g_match_window_hours = match_window_hours
     print(f"Worker process {os.getpid()} initialized with data.")
 
 
-def load_data_from_db(conn, tasks=None):
+def load_data_from_db(conn, tasks=None, match_window_hours=None):
     """
     Load full history for rebuilds, or only possible candidates for small updates.
     """
-    if tasks is not None and len(tasks) <= 200:
-        return load_candidate_data(conn, tasks)
+    # A narrow screenshot-time window makes name-first candidate loading useful
+    # even when the Twitch VOD set is large.
+    if tasks is not None and (len(tasks) <= 200 or match_window_hours is not None):
+        return load_candidate_data(conn, tasks, match_window_hours)
     print("Loading data from database...")
     cursor = conn.cursor()
 
@@ -109,7 +124,7 @@ def load_data_from_db(conn, tasks=None):
     return inverted_index, battle_data
 
 
-def load_candidate_data(conn, tasks):
+def load_candidate_data(conn, tasks, match_window_hours=None):
     """Use indexed name lookups and date bounds before reading entire rosters."""
     names, dates = set(), []
     for _, info in tasks:
@@ -136,8 +151,12 @@ def load_candidate_data(conn, tasks):
         ON p.player_name = n.name''')
     bounded = dates and all(date is not None for date in dates)
     if bounded:
-        start = min(dates) - relativedelta(months=MAX_DATE_RANGE_MONTHS)
-        end = max(dates)
+        if match_window_hours is not None:
+            start = min(dates) - timedelta(days=1)
+            end = max(dates) + timedelta(days=1)
+        else:
+            start = min(dates) - relativedelta(months=MAX_DATE_RANGE_MONTHS)
+            end = max(dates)
     for bid, timestamp in conn.execute('''SELECT b.battle_id, b.timestamp
             FROM match_candidates c CROSS JOIN battles b ON b.battle_id = c.battle_id'''):
         if bounded:
@@ -162,10 +181,12 @@ def load_candidate_data(conn, tasks):
     return inverted_index, battle_data
 
 
-def find_best_match(ocr_player_list, video_upload_date_str, inverted_index, battle_data):
+def find_best_match(ocr_player_list, video_upload_date_str, inverted_index,
+                    battle_data, reference_time=None, window_hours=None):
     """
     Finds the best battle_id for a given list of OCR'd players.
-    Applies the configured date filter. Uses raw, case-sensitive strings.
+    Applies either the screenshot-time window (Twitch) or the upload-date
+    window (YouTube). Uses raw, case-sensitive strings.
     """
     
     # Use raw OCR'd names
@@ -214,7 +235,15 @@ def find_best_match(ocr_player_list, video_upload_date_str, inverted_index, batt
             continue # Should not happen if DB is consistent
 
         # Date Check
-        if upload_dt:
+        if reference_time is not None and window_hours:
+            try:
+                battle_dt = _parse_utc(battle_info['timestamp'])
+            except (ValueError, TypeError):
+                continue
+            if not (reference_time - timedelta(hours=window_hours)
+                    <= battle_dt <= reference_time + timedelta(hours=window_hours)):
+                continue
+        elif upload_dt:
             try:
                 # Parse battle timestamp, removing timezone info to compare with naive upload_dt
                 # This assumes battle timestamps are UTC, but compares them all consistently.
@@ -290,6 +319,13 @@ def process_video_task(task_args):
     
     # Unpack the lightweight task-specific data
     video_id, video_info = task_args
+    match_window_hours = g_match_window_hours
+    started_dt = None
+    if match_window_hours and video_info.get('started_at'):
+        try:
+            started_dt = _parse_utc(video_info.get('started_at'))
+        except (ValueError, TypeError):
+            started_dt = None
     
     
     video_db_tuple = (
@@ -307,11 +343,20 @@ def process_video_task(task_args):
         
         # ***MODIFIED***
         # Pass the process-global data to the matching function
+        reference_time = None
+        if started_dt is not None:
+            try:
+                reference_time = started_dt + timedelta(seconds=int(timestamp_sec))
+            except (ValueError, TypeError):
+                reference_time = None
+
         battle_id, score = find_best_match(
             ocr_player_list,
             video_info.get('upload_date'),
             g_inverted_index,
-            g_battle_data
+            g_battle_data,
+            reference_time=reference_time,
+            window_hours=match_window_hours if reference_time else None
         )
         
         if battle_id:

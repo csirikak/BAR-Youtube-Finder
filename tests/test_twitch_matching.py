@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 
+import findScreenshotBattles as matching
 import findTwitchBattles
 from updateBattleDB import setup_database
 from updateSchema import add_new_tables
@@ -40,6 +41,7 @@ class TwitchMatchingTests(unittest.TestCase):
                 "twitch_123": {
                     "title": "Twitch VOD",
                     "upload_date": "20260902",
+                    "started_at": "2026-09-01T18:00:00Z",
                     "uploader": "Streamer",
                     "thumbnail": "https://thumb",
                     "screenshots": {"90": PLAYERS},
@@ -82,6 +84,27 @@ class TwitchMatchingTests(unittest.TestCase):
             self.assertNotIn("twitch_expired", saved)
             self.assertEqual(saved["twitch_123"]["screenshots"]["90"]
                              ["matched_battle_id"], "b1")
+
+    def test_screenshot_moment_limits_candidate_battles(self):
+        players = set(PLAYERS)
+        index = {name: ["far", "near"] for name in players}
+        battle_data = {
+            "far": {"timestamp": "2026-09-02T07:00:00Z", "players": players},
+            "near": {"timestamp": "2026-09-01T12:00:00Z", "players": players},
+        }
+        with redirect_stdout(io.StringIO()):
+            matching.init_worker(index, battle_data, match_window_hours=12)
+            try:
+                _, _, matches, screenshots = matching.process_video_task((
+                    "twitch_123",
+                    {"title": "VOD", "upload_date": "20260902",
+                     "started_at": "2026-09-01T18:00:00Z",
+                     "screenshots": {"90": PLAYERS}},
+                ))
+            finally:
+                matching.init_worker({}, {}, None)
+        self.assertEqual(matches[0][0], "near")
+        self.assertEqual(screenshots["90"]["matched_battle_id"], "near")
 
 
 if __name__ == "__main__":

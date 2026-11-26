@@ -125,7 +125,8 @@ class TwitchDiscoveryTests(unittest.TestCase):
         self.assertEqual(videos[0]["duration"], 600)
         call = session.post.call_args
         self.assertEqual(call.kwargs["json"]["variables"],
-                         {"slug": "beyond-all-reason", "first": 100})
+                         {"slug": "beyond-all-reason",
+                          "first": scrape_twitch.MAX_VIDEO_PAGE})
         self.assertIn("videos(first", call.kwargs["json"]["query"])
 
     def test_vod_discovery_pages_beyond_one_gql_page(self):
@@ -175,6 +176,53 @@ class TwitchDiscoveryTests(unittest.TestCase):
             since="20260924", session=session)
         self.assertEqual([video["video_id"] for video in videos], ["new"])
 
+    def test_full_discovery_walks_channel_archives(self):
+        category = Mock()
+        category.json.return_value = {"data": {"game": {"videos": {
+            "edges": [{"node": {
+                "id": "seed", "title": "Seed", "lengthSeconds": 300,
+                "createdAt": "2026-11-23T18:00:00Z", "viewCount": 5,
+                "owner": {"login": "alpha", "displayName": "Alpha"},
+            }}],
+        }}}}
+
+        def channel_node(video_id, date, game):
+            return {"node": {
+                "id": video_id, "title": video_id, "lengthSeconds": 600,
+                "publishedAt": date, "viewCount": 9,
+                "game": {"slug": game},
+                "owner": {"login": "alpha", "displayName": "Alpha"},
+            }}
+
+        channel = Mock()
+        channel.json.return_value = {"data": {"user": {"videos": {
+            "edges": [
+                channel_node("seed", "2026-11-23T18:00:00Z",
+                             "beyond-all-reason"),
+                channel_node("older", "2026-10-10T18:00:00Z",
+                             "beyond-all-reason"),
+                channel_node("newer", "2026-11-20T18:00:00Z",
+                             "beyond-all-reason"),
+                channel_node("music", "2026-11-21T18:00:00Z", "music"),
+            ],
+        }}}}
+        session = Mock()
+        session.post.side_effect = [category, channel]
+        videos = scrape_twitch.discover_videos(
+            since="20261001", session=session)
+        self.assertEqual([video["video_id"] for video in videos],
+                         ["seed", "newer", "older"])
+        self.assertEqual(session.post.call_count, 2)
+        call = session.post.call_args_list[1]
+        self.assertEqual(call.kwargs["json"]["operationName"],
+                         scrape_twitch.CHANNEL_VIDEOS_OPERATION)
+        self.assertEqual(call.kwargs["json"]["variables"], {
+            "limit": scrape_twitch.CHANNEL_VIDEO_PAGE,
+            "channelOwnerLogin": "alpha",
+            "broadcastType": "ARCHIVE",
+            "videoSort": "TIME",
+        })
+
     def test_limit_is_forwarded_to_gql(self):
         response = Mock()
         response.json.return_value = {"data": {"game": {
@@ -210,6 +258,37 @@ class TwitchVodCaptureTests(unittest.TestCase):
         self.assertFalse(info["is_live"])
         self.assertEqual(info["live_status"], "was_live")
         self.assertEqual(info["webpage_url"], "https://www.twitch.tv/videos/1234567890")
+        self.assertEqual(info["started_at"], "2026-11-23T18:22:21Z")
+
+    def test_new_vod_uses_five_minute_schedule(self):
+        with patch.object(scrape, "update_video_database", return_value=(1, 0)), \
+             patch.object(scrape, "process_video_screenshots",
+                          return_value=("twitch_1234567890", "Processed", 10)) as process:
+            result = scrape_twitch.capture_vod(
+                VOD, output_dir=self.frames, metadata_file=self.metadata,
+                extractor=lambda video_id: VOD_INFO)
+        self.assertEqual(result["status"], "processed")
+        info = process.call_args.args[0]
+        self.assertEqual(info["screenshot_interval_sec"],
+                         scrape_twitch.TWITCH_INTERVAL_SEC)
+        interval = scrape_twitch.TWITCH_INTERVAL_SEC
+        self.assertEqual(scrape.expected_timestamps(info)[:3],
+                         [90, 90 + interval, 90 + 2 * interval])
+
+    def test_legacy_vod_keeps_its_twelve_minute_schedule(self):
+        key = "twitch_1234567890"
+        legacy = {str(timestamp): [] for timestamp in range(90, 3000, 720)}
+        self.metadata.write_text(json.dumps({
+            key: {"duration": 3000, "screenshots": legacy},
+        }))
+        extractor = Mock()
+        result = scrape_twitch.capture_vod(
+            VOD, output_dir=self.frames, metadata_file=self.metadata,
+            extractor=extractor)
+        self.assertEqual(result["status"], "skipped")
+        extractor.assert_not_called()
+        saved = json.loads(self.metadata.read_text())[key]
+        self.assertEqual(saved["started_at"], "2026-11-23T18:22:21Z")
 
     def test_vod_without_seekable_formats_is_deferred(self):
         result = scrape_twitch.capture_vod(

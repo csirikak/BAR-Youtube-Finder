@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 from ultralytics import YOLO
+import argparse
 import json
 """
 YOLO-based UI Panel Detection for Beyond All Reason
@@ -30,7 +31,9 @@ Usage Modes:
 SCREENSHOT_DIR = "training_screenshots"
 LABELS_DIR = "yolo_labels"
 DATASET_DIR = "yolo_dataset"
-MODEL_PATH = "ui_detector.pt"  # Trained model path
+MODEL_PATH = "ui_detector.pt"  # Existing production model
+DEFAULT_TRAIN_MODEL = "yolo26s.pt"
+DEFAULT_EPOCHS = 100
 
 # ===========================================================
 
@@ -363,14 +366,18 @@ def prepare_yolo_dataset(screenshot_dir, labels_dir, dataset_dir, train_split=0.
     
     # Get all labeled images
     labels = list(Path(labels_dir).glob("*.txt"))
+    skipped = list(Path(labels_dir).glob("*.skip"))
+    label_by_stem = {path.stem: path for path in labels}
+    skipped_stems = {path.stem for path in skipped}
+    image_by_stem = {path.stem: path for path in Path(screenshot_dir).glob("**/*.png")}
     images = []
     
-    for label_file in labels:
-        img_path = Path(screenshot_dir) / f"{label_file.stem}.png"
-        if img_path.exists():
-            images.append((img_path, label_file))
+    for stem in sorted(set(label_by_stem) | skipped_stems):
+        img_path = image_by_stem.get(stem)
+        if img_path is not None:
+            images.append((img_path, label_by_stem.get(stem)))
     
-    print(f"\nFound {len(images)} labeled images")
+    print(f"\nFound {len(images)} training images ({len(skipped_stems)} negative/skip markers)")
     
     if len(images) == 0:
         print("ERROR: No labeled images found! Run labeling mode first.")
@@ -378,7 +385,7 @@ def prepare_yolo_dataset(screenshot_dir, labels_dir, dataset_dir, train_split=0.
     
     # Shuffle and split
     import random
-    random.shuffle(images)
+    random.Random(42).shuffle(images)
     split_idx = int(len(images) * train_split)
     train_set = images[:split_idx]
     val_set = images[split_idx:]
@@ -391,11 +398,15 @@ def prepare_yolo_dataset(screenshot_dir, labels_dir, dataset_dir, train_split=0.
     
     for img_path, label_path in train_set:
         shutil.copy(img_path, dataset_path / "images" / "train" / img_path.name)
-        shutil.copy(label_path, dataset_path / "labels" / "train" / label_path.name)
+        (shutil.copy(label_path, dataset_path / "labels" / "train" / label_path.name)
+         if label_path is not None else
+         (dataset_path / "labels" / "train" / f"{img_path.stem}.txt").touch())
     
     for img_path, label_path in val_set:
         shutil.copy(img_path, dataset_path / "images" / "val" / img_path.name)
-        shutil.copy(label_path, dataset_path / "labels" / "val" / label_path.name)
+        (shutil.copy(label_path, dataset_path / "labels" / "val" / label_path.name)
+         if label_path is not None else
+         (dataset_path / "labels" / "val" / f"{img_path.stem}.txt").touch())
     
     # Create data.yaml
     yaml_content = f"""# Beyond All Reason UI Panel Detection Dataset
@@ -421,7 +432,9 @@ nc: 1
     return yaml_path
 
 
-def train_yolo_model(data_yaml, epochs=50, img_size=640):
+def train_yolo_model(data_yaml, epochs=DEFAULT_EPOCHS, img_size=640,
+                     model_name=DEFAULT_TRAIN_MODEL, batch=8,
+                     name='ui_panel_detector', patience=10):
     """
     Train a YOLO model on the prepared dataset.
     """
@@ -429,14 +442,14 @@ def train_yolo_model(data_yaml, epochs=50, img_size=640):
     print("TRAINING YOLO MODEL")
     print("="*70)
     
-    # Load a pre-trained YOLO model (YOLOv11 nano for speed)
-    model = YOLO('yolov11n.pt')  # Use nano model as base
+    # Start from a COCO checkpoint, or pass ui_detector.pt to continue training it.
+    model = YOLO(model_name)
     
     print(f"\nTraining parameters:")
     print(f"  Data config: {data_yaml}")
     print(f"  Epochs: {epochs}")
     print(f"  Image size: {img_size}")
-    print(f"  Model: YOLOv11n (nano)")
+    print(f"  Model: {model_name}")
     print("\nStarting training...")
     
     # Train the model
@@ -444,15 +457,16 @@ def train_yolo_model(data_yaml, epochs=50, img_size=640):
         data=str(data_yaml),
         epochs=epochs,
         imgsz=img_size,
-        batch=8,
-        name='ui_panel_detector',
-        patience=10,  # Early stopping
+        batch=batch,
+        name=name,
+        exist_ok=True,
+        patience=patience,  # Early stopping
         save=True,
         plots=True
     )
     
     print("\n✓ Training complete!")
-    print(f"✓ Model saved to: runs/detect/ui_panel_detector/weights/best.pt")
+    print(f"✓ Model saved to: runs/detect/{name}/weights/best.pt")
     
     return model
 
@@ -521,6 +535,22 @@ def run_inference(model_path, screenshot_dir, output_dir="detected_ui"):
     print(f"✓ JSON data saved to: {json_path}")
 
 
+def parse_train_options():
+    """Parse options after the train/pipeline mode."""
+    import sys
+    parser = argparse.ArgumentParser(description="Train the BAR UI panel detector")
+    parser.add_argument(
+        "--model", default=DEFAULT_TRAIN_MODEL,
+        help="checkpoint to start from (default: yolo26s.pt; use "
+             "ui_detector.pt to continue the current model)")
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--name", default="ui_panel_detector")
+    parser.add_argument("--patience", type=int, default=10)
+    return parser.parse_args(sys.argv[2:])
+
+
 def main():
     import sys
     
@@ -530,10 +560,10 @@ def main():
     
     if len(sys.argv) < 2:
         print("\nUsage:")
-        print("  python yolo_ui_detector.py label      - Label training data")
-        print("  python yolo_ui_detector.py train      - Train YOLO model")
-        print("  python yolo_ui_detector.py infer      - Run inference on screenshots")
-        print("  python yolo_ui_detector.py pipeline   - Complete pipeline (label + train + infer)")
+        print("  python bbox.py label      - Label training data")
+        print("  python bbox.py train      - Train YOLO model")
+        print("  python bbox.py infer      - Run inference on screenshots")
+        print("  python bbox.py pipeline   - Complete pipeline (label + train + infer)")
         return
     
     mode = sys.argv[1].lower()
@@ -543,9 +573,13 @@ def main():
         detector.labeling_mode()
         
     elif mode == "train":
+        options = parse_train_options()
         yaml_path = prepare_yolo_dataset(SCREENSHOT_DIR, LABELS_DIR, DATASET_DIR)
         if yaml_path:
-            train_yolo_model(yaml_path, epochs=100)
+            train_yolo_model(
+                yaml_path, epochs=options.epochs, img_size=options.imgsz,
+                model_name=options.model, batch=options.batch,
+                name=options.name, patience=options.patience)
         
     elif mode == "infer":
         if not Path(MODEL_PATH).exists():
@@ -563,6 +597,7 @@ def main():
         run_inference(MODEL_PATH_ACTUAL, SCREENSHOT_DIR)
         
     elif mode == "pipeline":
+        options = parse_train_options()
         print("\n🚀 Running complete pipeline...\n")
         
         # Step 1: Label
@@ -574,7 +609,10 @@ def main():
         print("\nSTEP 2: Training")
         yaml_path = prepare_yolo_dataset(SCREENSHOT_DIR, LABELS_DIR, DATASET_DIR)
         if yaml_path:
-            train_yolo_model(yaml_path, epochs=100)
+            train_yolo_model(
+                yaml_path, epochs=options.epochs, img_size=options.imgsz,
+                model_name=options.model, batch=options.batch,
+                name=options.name, patience=options.patience)
         else:
             return
         

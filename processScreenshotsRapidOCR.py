@@ -1,14 +1,16 @@
 """Extract BAR player names with one GPU model owner and bounded image batches."""
 
 import argparse
-from contextlib import nullcontext
-from concurrent.futures import ThreadPoolExecutor
 import json
 import os
-from pathlib import Path
 import re
 import tempfile
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from pathlib import Path
+from queue import Queue
 
 import cv2
 
@@ -21,7 +23,7 @@ logger = ui.get("ocr")
 
 DEBUG_MODE = False
 MODEL_PATH = "ui_detector.pt"
-YOLO_CONF_THRESHOLD = 0.80
+YOLO_CONF_THRESHOLD = 0.7
 SCREENSHOTS_DIR = "data/AllBarScreenshots"
 JSON_OUTPUT_FILE = "data/screenshot_data.json"
 PLAYER_DATABASE = "data/game_battles.db"
@@ -63,14 +65,23 @@ def save_metadata(filename, data):
             temporary.unlink(missing_ok=True)
 
 
-def pending_frames(directory, data, reprocess=False):
+def needs_recognition(data, video_id, timestamp, reprocess=False,
+                      reprocess_empty=False):
+    """Whether a frame should be OCR'd with the current retry mode."""
+    screenshots = data.get(video_id, {}).get("screenshots", {})
+    return (reprocess or timestamp not in screenshots
+            or (reprocess_empty and screenshots[timestamp] == []))
+
+
+def pending_frames(directory, data, reprocess=False, reprocess_empty=False):
     frames = []
     for path in sorted(Path(directory).rglob("*.png")):
         match = FRAME_NAME.fullmatch(path.name)
         if not match:  # Includes unfinished scraper captures (*.part.png).
             continue
         video_id, timestamp = match.groups()
-        if reprocess or timestamp not in data.get(video_id, {}).get("screenshots", {}):
+        if needs_recognition(data, video_id, timestamp, reprocess,
+                             reprocess_empty):
             frames.append((path, video_id, timestamp))
     return frames
 
@@ -99,6 +110,8 @@ def resolve_device(device="auto"):
         raise ValueError("OCR supports cpu or cuda[:index] (including AMD ROCm)")
     if resolved.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("GPU requested but PyTorch cannot access it")
+    if resolved.type == "cuda" and resolved.index is None:
+        resolved = torch.device("cuda", torch.cuda.current_device())
     return resolved
 
 
@@ -126,6 +139,31 @@ def reader_params(resolved):
     }
 
 
+def reduce_recognition_on_gpu(reader):
+    """Keep PP-OCRv6's full character scores on the GPU."""
+    import torch
+
+    recognizer = reader.text_rec
+    session = recognizer.session
+    decoder = recognizer.postprocess_op
+
+    @torch.inference_mode()
+    def best_characters(images):
+        scores = session.predictor(torch.from_numpy(images).to(session.device))
+        probabilities, indices = scores.max(dim=2)
+        return indices.cpu().numpy(), probabilities.cpu().numpy()
+
+    def decode(predictions, return_word_box=False, **kwargs):
+        indices, probabilities = predictions
+        return decoder.decode(indices, probabilities, return_word_box,
+                              remove_duplicate=True, **kwargs)
+
+    # In RapidOCR 3.9.2, the Torch session copies all ~19,000 scores per
+    # character position to NumPy. Its CTC decoder only needs the winners.
+    recognizer.session = best_characters
+    recognizer.postprocess_op = decode
+
+
 def create_engines(model_path, device="auto", workers=1):
     """Build the UI detector once and one RapidOCR reader per worker."""
     import torch
@@ -143,6 +181,9 @@ def create_engines(model_path, device="auto", workers=1):
         label = "CPU"
     readers = [RapidOCR(params=reader_params(resolved))
                for _ in range(max(1, workers))]
+    if resolved.type == "cuda":
+        for reader in readers:
+            reduce_recognition_on_gpu(reader)
     logger.info("OCR device %s (%s) · %d reader(s)", resolved, label, len(readers))
     detector = YOLO(str(model_path))
     detector.to(str(resolved))
@@ -168,7 +209,13 @@ def panel_bounds(result, image_shape):
     if result.boxes is None:
         return None
     candidates = []
-    for box in result.boxes:
+    # Move the whole result to the host before inspecting individual boxes.
+    # Reading GPU confidence and coordinate scalars separately synchronizes
+    # the stream for each candidate.
+    boxes = result.boxes
+    if hasattr(boxes, "cpu"):
+        boxes = boxes.cpu()
+    for box in boxes:
         confidence = float(box.conf[0])
         if confidence <= YOLO_CONF_THRESHOLD:
             continue
@@ -182,7 +229,8 @@ def panel_bounds(result, image_shape):
 
 def find_ui_panel(screenshot, yolo_model):
     # Let inference errors propagate: an error is not evidence of an empty frame.
-    return panel_bounds(yolo_model(screenshot, verbose=False)[0], screenshot.shape)
+    detection = yolo_model(screenshot, verbose=False, conf=YOLO_CONF_THRESHOLD)[0]
+    return panel_bounds(detection, screenshot.shape)
 
 
 def names_from_result(result, catalog, panel_width):
@@ -217,7 +265,10 @@ def recognize_panel(image, bounds, reader, catalog, debug=False):
     if bounds is None:
         return []
     x1, y1, x2, y2 = bounds
-    panel = image[y1:y2, x1:x2]
+    return recognize_crop(image[y1:y2, x1:x2], reader, catalog, debug)
+
+
+def recognize_crop(panel, reader, catalog, debug=False):
     names = names_from_result(reader(panel), catalog, panel.shape[1])
     if debug:
         cv2.imshow("Player panel", panel)
@@ -237,7 +288,7 @@ def ocr_bottom_right_element(screenshot_path, debug=False, reader=None,
 def detect_batch(detector, images):
     """Retry individually after a batch failure so healthy frames still complete."""
     try:
-        results = list(detector(images, verbose=False))
+        results = list(detector(images, verbose=False, conf=YOLO_CONF_THRESHOLD))
         if len(results) != len(images):
             raise RuntimeError("UI detector returned an incomplete batch")
         return results
@@ -247,7 +298,7 @@ def detect_batch(detector, images):
         results = []
         for image in images:
             try:
-                results.append(detector(image, verbose=False)[0])
+                results.append(detector(image, verbose=False, conf=YOLO_CONF_THRESHOLD)[0])
             except Exception as individual_error:
                 results.append(individual_error)
         return results
@@ -255,22 +306,25 @@ def detect_batch(detector, images):
 
 def make_recognizer_pool(readers, device, debug=False):
     """Exclusive reader slots, each on its own CUDA stream so calls overlap."""
-    if debug or len(readers) < 2:
+    if debug or (device.type == "cpu" and len(readers) < 2):
         return None, None
     import torch
-    from queue import Queue
 
-    streams = ([torch.cuda.Stream(device=device) for _ in readers]
-               if device.type == "cuda" else [None] * len(readers))
     slots = Queue()
-    for reader, stream in zip(readers, streams):
+    for reader in readers:
+        stream = None
+        if device.type == "cuda":
+            stream = torch.cuda.Stream(device=device)
+            # The reader's weights were loaded on the initialization stream.
+            stream.wait_stream(torch.cuda.current_stream(device))
         slots.put((reader, stream))
     return ThreadPoolExecutor(max_workers=len(readers)), slots
 
 
 def main(*, screenshots_dir=SCREENSHOTS_DIR, output_file=JSON_OUTPUT_FILE,
          model_path=MODEL_PATH, player_database=PLAYER_DATABASE, device="auto",
-         batch_size=8, checkpoint_every=50, reprocess=False, debug=DEBUG_MODE,
+         batch_size=8, checkpoint_every=50, reprocess=False,
+         reprocess_empty=False, debug=DEBUG_MODE,
          frame_batches=None, metadata_lock=None, ocr_workers=None):
     if batch_size < 1 or checkpoint_every < 1:
         raise ValueError("Batch size and checkpoint interval must be positive")
@@ -280,7 +334,8 @@ def main(*, screenshots_dir=SCREENSHOTS_DIR, output_file=JSON_OUTPUT_FILE,
         data = load_metadata(output_file)
     total = "stream"
     if frame_batches is None:
-        frames = pending_frames(screenshots_dir, data, reprocess)
+        frames = pending_frames(screenshots_dir, data, reprocess,
+                                reprocess_empty)
         total = len(frames)
         frame_batches = (frames[offset:offset + batch_size]
                          for offset in range(0, len(frames), batch_size))
@@ -289,6 +344,7 @@ def main(*, screenshots_dir=SCREENSHOTS_DIR, output_file=JSON_OUTPUT_FILE,
     completed = 0
     dirty = {}
     failures = []
+    pending = deque()
     started = time.perf_counter()
 
     def failed(frame, error):
@@ -307,14 +363,14 @@ def main(*, screenshots_dir=SCREENSHOTS_DIR, output_file=JSON_OUTPUT_FILE,
         if len(dirty) >= checkpoint_every:
             checkpoint()
 
-    def recognize_with_slot(image, bounds):
+    def recognize_with_slot(panel):
         reader_instance, stream = slots.get()
         try:
             if stream is None:
-                return recognize_panel(image, bounds, reader_instance, catalog, debug)
+                return recognize_crop(panel, reader_instance, catalog)
             import torch
             with torch.cuda.stream(stream):
-                return recognize_panel(image, bounds, reader_instance, catalog, debug)
+                return recognize_crop(panel, reader_instance, catalog)
         finally:
             slots.put((reader_instance, stream))
 
@@ -327,11 +383,40 @@ def main(*, screenshots_dir=SCREENSHOTS_DIR, output_file=JSON_OUTPUT_FILE,
         logger.info("OCR · %d%s frame(s) recognized", completed,
                     f"/{total}" if isinstance(total, int) else "")
 
+    def collect(count=None, *, ready_only=False):
+        for _ in range(len(pending) if count is None else count):
+            frame, job = pending[0]
+            if ready_only and job is not None and not job.done():
+                break
+            pending.popleft()
+            try:
+                names = job.result() if job is not None else []
+            except Exception as error:
+                failed(frame, error)
+                continue
+            record(frame, names)
+
     try:
         with ThreadPoolExecutor(max_workers=min(4, batch_size)) as decoders:
-            for batch in frame_batches:
-                batch = [frame for frame in batch if reprocess or frame[2] not in
-                         data.get(frame[1], {}).get("screenshots", {})]
+            batches = iter(frame_batches)
+            while True:
+                try:
+                    batch = next(batches, None)
+                except Exception:
+                    # Save work already submitted before the producer failed.
+                    collect()
+                    raise
+                if batch is None:
+                    break
+                if not batch:
+                    collect()  # Capture is idle.
+                    continue
+                pending_keys = {frame[1:] for frame, _ in pending}
+                if any(frame[1:] in pending_keys for frame in batch):
+                    collect()
+                batch = [frame for frame in batch
+                         if needs_recognition(data, frame[1], frame[2],
+                                              reprocess, reprocess_empty)]
                 if not batch:
                     continue
                 if reader is None:
@@ -355,39 +440,36 @@ def main(*, screenshots_dir=SCREENSHOTS_DIR, output_file=JSON_OUTPUT_FILE,
                     except Exception as error:
                         failed(frame, error)
                 if not images:
+                    collect()
                     continue
+                previous = len(pending)
                 detections = detect_batch(detector, images)
-                if ocr_pool is None:
-                    for frame, image, detection in zip(valid, images, detections):
-                        try:
-                            if isinstance(detection, Exception):
-                                raise detection
-                            bounds = panel_bounds(detection, image.shape)
-                            names = recognize_panel(image, bounds, reader, catalog, debug)
-                        except Exception as error:
-                            failed(frame, error)
-                            continue
-                        record(frame, names)
-                else:
-                    jobs = []
-                    for frame, image, detection in zip(valid, images, detections):
+                for frame, image, detection in zip(valid, images, detections):
+                    try:
                         if isinstance(detection, Exception):
-                            failed(frame, detection)
-                            continue
-                        try:
-                            bounds = panel_bounds(detection, image.shape)
-                        except Exception as error:
-                            failed(frame, error)
-                            continue
-                        jobs.append((frame, ocr_pool.submit(recognize_with_slot,
-                                                            image, bounds)))
-                    for frame, job in jobs:
-                        try:
-                            names = job.result()
-                        except Exception as error:
-                            failed(frame, error)
-                            continue
+                            raise detection
+                        bounds = panel_bounds(detection, image.shape)
+                        if ocr_pool is None:
+                            names = recognize_panel(image, bounds, reader, catalog, debug)
+                        elif bounds is not None:
+                            x1, y1, x2, y2 = bounds
+                            # Keep only the small crop while the next batch decodes.
+                            panel = image[y1:y2, x1:x2].copy()
+                            pending.append((frame, ocr_pool.submit(recognize_with_slot, panel)))
+                        else:
+                            pending.append((frame, None))
+                    except Exception as error:
+                        failed(frame, error)
+                        continue
+                    if ocr_pool is None:
                         record(frame, names)
+                # OCR can run through decoding and YOLO for the next batch.
+                # Collect the previous batch now so the queue stays bounded.
+                collect(previous)
+            collect()
+    except KeyboardInterrupt:
+        collect(ready_only=True)
+        raise
     finally:
         if ocr_pool is not None:
             ocr_pool.shutdown(wait=True)
@@ -419,5 +501,7 @@ if __name__ == "__main__":
                         help="parallel OCR readers (default: 3 on GPU, 1 on CPU)")
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--reprocess", action="store_true", help="Replace results for available frames")
+    parser.add_argument("--reprocess-empty", action="store_true",
+                        help="Replace saved empty results for available frames")
     parser.add_argument("--debug", action="store_true")
     main(**vars(parser.parse_args()))

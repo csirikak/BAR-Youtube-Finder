@@ -39,13 +39,13 @@ test('platform filtering can show YouTube, Twitch, or both', () => {
     assert.ok(index.search({query: 'graceful', platform: 'twitch'}).items
         .every(item => item.platform === 'twitch'));
 });
-test('Twitch links older than 60 days are hidden from every platform filter', () => {
+test('Twitch links older than 50 days are hidden from every platform filter', () => {
     const data = fixture();
-    data.videos[1][3] = '20260923';
+    data.videos[1][3] = '20261003';
     const expired = makeIndex(data);
     assert.equal(expired.search({query: 'graceful', platform: 'twitch'}).count, 0);
     assert.equal(expired.search({query: 'graceful', platform: 'both'}).count, 1);
-    data.videos[1][3] = '20260924';
+    data.videos[1][3] = '20261004';
     assert.equal(makeIndex(data).search({query: 'graceful', platform: 'twitch'}).count, 2);
 });
 test('previous names resolve to one account and keep every battle', () => {

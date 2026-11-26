@@ -3,6 +3,7 @@ from contextlib import nullcontext, redirect_stdout
 import io
 import json
 from pathlib import Path
+import struct
 import subprocess
 import tempfile
 import threading
@@ -153,6 +154,16 @@ class UpdateTests(unittest.TestCase):
         stream.close()
         self.assertEqual(list(batches), [])
 
+    def test_stream_signals_idle_so_ocr_can_collect_pending_results(self):
+        stream = update.FrameStream(1)
+        stream.put("video_90s.png")
+        batches = stream.batches(flush_idle=True)
+        self.assertEqual(next(batches)[0][2], "90")
+        self.assertEqual(next(batches), [])
+        stream.put("video_810s.png")
+        stream.close()
+        self.assertEqual([[f[2] for f in batch] for batch in batches], [["810"]])
+
     def patch_pipeline(self):
         patch.object(update, "network_services", return_value=nullcontext()).start()
         self.ingestion = patch.object(update, "run_ingestion").start()
@@ -233,6 +244,12 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.twitch_ingestion.call_args.kwargs["limit"],
                          update.scrape_twitch.MAX_VIDEO_PAGE)
 
+    def test_twitch_default_populates_full_retention_window(self):
+        self.patch_pipeline()
+        update.main()
+        self.assertEqual(self.twitch_ingestion.call_args.kwargs["limit"],
+                         update.scrape_twitch.MAX_VIDEO_PAGE)
+
     def test_twitch_full_overrides_a_zero_limit(self):
         self.patch_pipeline()
         update.main(twitch_limit=0, twitch_full=True)
@@ -289,6 +306,86 @@ class UpdateTests(unittest.TestCase):
             with update.network_services(use_warp=False):
                 pass
         start.assert_not_called()
+
+    def screenshot(self, name, width, height):
+        path = self.root / name
+        path.write_bytes(
+            b"\x89PNG\r\n\x1a\n"
+            + b"\x00\x00\x00\rIHDR"
+            + struct.pack(">II", width, height))
+        return path
+
+    def test_screenshot_resolutions_are_bucketed(self):
+        resolutions = update.ScreenshotResolutions()
+        for name, width, height in [
+            ("4k.png", 3840, 2160),
+            ("2k.png", 2560, 1440),
+            ("1080.png", 1920, 1080),
+            ("720.png", 1280, 720),
+            ("480.png", 854, 480),
+            ("other.png", 640, 360),
+        ]:
+            resolutions.add(self.screenshot(name, width, height))
+        resolutions.add(self.root / "missing.png")
+        self.assertEqual(resolutions.snapshot(), {
+            "4K": 1, "2K": 1, "1080p": 1, "720p": 1,
+            "480p": 1, "Other": 1,
+        })
+
+    def test_youtube_and_twitch_capture_resolutions_are_counted(self):
+        youtube = update.ScreenshotResolutions()
+        twitch = update.ScreenshotResolutions()
+        youtube_frame = self.screenshot("video_90s.png", 1920, 1080)
+        twitch_frame = self.screenshot("twitch_123_90s.png", 1280, 720)
+
+        def youtube_source(channel, directory, **kwargs):
+            kwargs["on_screenshot"](youtube_frame)
+            return True
+
+        def twitch_source(**kwargs):
+            kwargs["on_screenshot"](twitch_frame)
+
+        with patch.object(battles, "main"), \
+             patch.object(update.scrape, "get_channel_screenshots",
+                          side_effect=youtube_source), \
+             patch.object(update.ocr, "main"):
+            self.ingest(resolutions=youtube)
+        with patch.object(update.scrape_twitch, "capture_category",
+                          side_effect=twitch_source), \
+             patch.object(update.ocr, "main"):
+            update.run_twitch_ingestion(limit=5, resolutions=twitch)
+        self.assertEqual(youtube.snapshot()["1080p"], 1)
+        self.assertEqual(twitch.snapshot()["720p"], 1)
+
+    def test_report_summary_prints_screenshot_resolutions(self):
+        with patch.object(update.ui, "stats_table") as table:
+            update.report_summary(
+                update.scrape.IngestionStats(), update.StageTimes(),
+                screenshot_resolutions={
+                    "YouTube": {"4K": 0, "2K": 2, "1080p": 10,
+                                "720p": 1, "480p": 0, "Other": 0},
+                    "Twitch": {"4K": 1, "2K": 0, "1080p": 5,
+                               "720p": 0, "480p": 0, "Other": 0},
+                })
+        table.assert_called_once()
+        title, rows = table.call_args.args
+        self.assertEqual(title, "Screenshot resolutions")
+        self.assertEqual(rows, [
+            ("YouTube", "2K 2 · 1080p 10 · 720p 1"),
+            ("Twitch", "4K 1 · 1080p 5"),
+        ])
+
+    def test_main_counts_resolutions_for_both_platforms(self):
+        self.patch_pipeline()
+        youtube_frame = self.screenshot("youtube.png", 1920, 1080)
+        twitch_frame = self.screenshot("twitch.png", 2560, 1440)
+        self.ingestion.side_effect = lambda **kwargs: kwargs["resolutions"].add(youtube_frame)
+        self.twitch_ingestion.side_effect = lambda **kwargs: kwargs["resolutions"].add(twitch_frame)
+        with patch.object(update, "report_summary") as report:
+            update.main()
+        counts = report.call_args.kwargs["screenshot_resolutions"]
+        self.assertEqual(counts["YouTube"]["1080p"], 1)
+        self.assertEqual(counts["Twitch"]["2K"], 1)
 
 
 class ReplayFailureTests(unittest.TestCase):

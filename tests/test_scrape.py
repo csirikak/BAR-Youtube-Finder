@@ -55,6 +55,25 @@ class ScraperTests(unittest.TestCase):
         self.write_frame(timestamp=810)
         self.assertEqual(scrape.populateHaveSet(self.output, db), {'example'})
 
+    def test_per_video_interval_overrides_default_schedule(self):
+        info = video(duration=1000, screenshot_interval_sec=300)
+        self.assertEqual(scrape.expected_timestamps(info),
+                         [90, 390, 690, 990])
+        self.assertEqual(scrape.expected_timestamps(video(duration=1000)),
+                         [90, 810])
+
+    def test_per_video_interval_is_persisted(self):
+        scrape.update_video_database(
+            [video(screenshot_interval_sec=300)], self.database)
+        saved = json.loads(self.database.read_text())['example']
+        self.assertEqual(saved['screenshot_interval_sec'], 300)
+
+    def test_broadcast_start_is_persisted(self):
+        scrape.update_video_database(
+            [video(started_at='2026-09-01T18:00:00Z')], self.database)
+        saved = json.loads(self.database.read_text())['example']
+        self.assertEqual(saved['started_at'], '2026-09-01T18:00:00Z')
+
     def test_ocr_and_files_together_complete_schedule(self):
         db = {'example': video(screenshots={'90': []})}
         self.assertEqual(scrape.populateHaveSet(self.output, db), set())

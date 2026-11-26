@@ -137,6 +137,28 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(set(self.saved()["video_id"]["screenshots"]),
                          {"90", "810", "1530", "2250"})
 
+    def test_detection_runs_while_previous_batch_is_recognizing(self):
+        self.frame(810, value=1)
+        self.frame(90, value=2)
+        second_detection = threading.Event()
+        first_recognizing = threading.Event()
+
+        def recognize(panel):
+            if panel[0, 0, 0] == 1:
+                first_recognizing.set()
+                self.assertTrue(second_detection.wait(3))
+            return text_result()
+
+        def detect(images, **kwargs):
+            if images[0][0, 0, 0] == 2:
+                self.assertTrue(first_recognizing.wait(3))
+                second_detection.set()
+            return [detection(image) for image in images]
+
+        self.detector.side_effect = detect
+        self.factory.return_value = (self.detector, [recognize, recognize])
+        self.assertEqual(self.run_ocr(batch_size=1, device="cpu")["processed"], 2)
+
     def test_completed_empty_results_skip_models(self):
         self.frame(90)
         self.output.write_text(json.dumps({"video_id": {"screenshots": {"90": []}}}))
@@ -230,6 +252,23 @@ class PipelineTests(unittest.TestCase):
         self.output.write_text(json.dumps({"video_id": {"screenshots": {"90": [], "810": ["Keep"]}}}))
         self.run_ocr(reprocess=True)
         self.assertEqual(self.saved()["video_id"]["screenshots"], {"90": ["KnownName"], "810": ["Keep"]})
+
+    def test_reprocess_empty_revisits_only_empty_results(self):
+        self.frame(90)
+        self.frame(810)
+        self.output.write_text(json.dumps({"video_id": {"screenshots": {
+            "90": [], "810": ["Keep"]}}}))
+        self.run_ocr(reprocess_empty=True)
+        self.reader.assert_called_once()
+        self.assertEqual(self.saved()["video_id"]["screenshots"],
+                         {"90": ["KnownName"], "810": ["Keep"]})
+
+    def test_reprocess_empty_does_not_touch_completed_frames(self):
+        self.frame(90)
+        self.output.write_text(json.dumps({"video_id": {"screenshots": {
+            "90": ["Keep"]}}}))
+        self.assertEqual(self.run_ocr(reprocess_empty=True)["processed"], 0)
+        self.reader.assert_not_called()
 
     def test_streaming_checkpoint_merges_concurrent_scraper_metadata(self):
         import scrape

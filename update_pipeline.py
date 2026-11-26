@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from queue import Empty, Queue
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -61,6 +62,57 @@ class StageTimes:
             logger.info("[green]✓[/green] %s · %s", name, ui.duration(elapsed))
 
 
+RESOLUTION_BUCKETS = ("4K", "2K", "1080p", "720p", "480p", "Other")
+
+
+def png_dimensions(filename):
+    """Read a PNG's dimensions from its IHDR without decoding the image."""
+    try:
+        with open(filename, "rb") as image:
+            header = image.read(24)
+    except OSError:
+        return None
+    if (len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n"
+            or header[12:16] != b"IHDR"):
+        return None
+    return struct.unpack(">II", header[16:24])
+
+
+def resolution_bucket(width, height):
+    """Map a screenshot's pixel dimensions to a display-oriented bucket."""
+    if width >= 3840 or height >= 2160:
+        return "4K"
+    if width >= 2560 or height >= 1440:
+        return "2K"
+    if width >= 1920 or height >= 1080:
+        return "1080p"
+    if width >= 1280 or height >= 720:
+        return "720p"
+    if width >= 854 or height >= 480:
+        return "480p"
+    return "Other"
+
+
+class ScreenshotResolutions:
+    """Thread-safe counts of captured screenshots by resolution bucket."""
+
+    def __init__(self):
+        self.counts = {bucket: 0 for bucket in RESOLUTION_BUCKETS}
+        self.lock = threading.Lock()
+
+    def add(self, filename):
+        dimensions = png_dimensions(filename)
+        if dimensions is None:
+            return
+        bucket = resolution_bucket(*dimensions)
+        with self.lock:
+            self.counts[bucket] += 1
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.counts)
+
+
 class FrameStream:
     """Queue file paths, never full images; flush small OCR batches promptly."""
 
@@ -94,12 +146,17 @@ class FrameStream:
                 self.closed = True
                 self.queue.put(None)
 
-    def batches(self):
+    def batches(self, *, flush_idle=False):
+        """Yield an empty batch after a lull so OCR can collect in-flight work."""
         finished = False
+        batch_in_flight = False
         while not finished and not self.stop_event.is_set():
             try:
                 frame = self.queue.get(timeout=0.2)
             except Empty:
+                if flush_idle and batch_in_flight:
+                    batch_in_flight = False
+                    yield []
                 continue
             if frame is None:
                 return
@@ -114,11 +171,13 @@ class FrameStream:
                     finished = True
                     break
                 batch.append(frame)
+            batch_in_flight = True
             yield batch
 
 
 def scrape_channels(channel_urls, screenshots_dir, metadata_file, stream,
-                    channel_workers=2, capture_workers=4, stop_event=None, stats=None):
+                    channel_workers=2, capture_workers=4, stop_event=None,
+                    stats=None, on_screenshot=None):
     claimed_ids = set()
     failures = []
     try:
@@ -130,7 +189,8 @@ def scrape_channels(channel_urls, screenshots_dir, metadata_file, stream,
                     sources.submit(
                         scrape.get_channel_screenshots, channel, screenshots_dir,
                         capture_executor=captures, claimed_ids=claimed_ids,
-                        on_screenshot=stream.put, metadata_file=metadata_file,
+                        on_screenshot=on_screenshot or stream.put,
+                        metadata_file=metadata_file,
                         stop_event=stop_event, stats=stats
                     ): channel for channel in channel_urls
                 }
@@ -146,13 +206,19 @@ def scrape_channels(channel_urls, screenshots_dir, metadata_file, stream,
 
 def run_ingestion(*, channel_urls, screenshots_dir, metadata_file, player_database,
                   channel_workers=2, capture_workers=4, ocr_batch_size=8, times=None,
-                  stats=None, ocr_workers=None):
+                  stats=None, ocr_workers=None, resolutions=None):
     if min(channel_workers, capture_workers, ocr_batch_size) < 1:
         raise ValueError("Worker counts and OCR batch size must be positive")
     times = times or StageTimes()
     stats = stats or scrape.IngestionStats()
+    resolutions = resolutions or ScreenshotResolutions()
     stop_event = threading.Event()
     stream = FrameStream(ocr_batch_size, stop_event=stop_event)
+
+    def queue_frame(path):
+        resolutions.add(path)
+        stream.put(path)
+
     initial = ocr.load_metadata(metadata_file)
     for path, _, _ in ocr.pending_frames(screenshots_dir, initial):
         stream.put(path)
@@ -163,7 +229,7 @@ def run_ingestion(*, channel_urls, screenshots_dir, metadata_file, player_databa
         capture = stages.submit(
             times.run, "YouTube capture", scrape_channels, channel_urls,
             screenshots_dir, metadata_file, stream, channel_workers, capture_workers,
-            stop_event, stats
+            stop_event, stats, on_screenshot=queue_frame
         )
 
         def consume():
@@ -173,7 +239,7 @@ def run_ingestion(*, channel_urls, screenshots_dir, metadata_file, player_databa
             return times.run(
                 "OCR", ocr.main, screenshots_dir=screenshots_dir,
                 output_file=metadata_file, player_database=player_database,
-                batch_size=ocr_batch_size, frame_batches=stream.batches(),
+                batch_size=ocr_batch_size, frame_batches=stream.batches(flush_idle=True),
                 metadata_lock=scrape.DB_LOCK, ocr_workers=ocr_workers
             )
 
@@ -190,7 +256,7 @@ def run_ingestion(*, channel_urls, screenshots_dir, metadata_file, player_databa
 
 
 def run_twitch_ingestion(*, limit, capture_workers=2, ocr_batch_size=8,
-                         times=None, stats=None, ocr_workers=None):
+                         times=None, stats=None, ocr_workers=None, resolutions=None):
     """Capture category VODs and OCR them into the separate Twitch metadata."""
     if limit < 1:
         raise ValueError("Twitch VOD limit must be positive")
@@ -198,8 +264,14 @@ def run_twitch_ingestion(*, limit, capture_workers=2, ocr_batch_size=8,
         raise ValueError("Twitch capture worker count must be positive")
     times = times or StageTimes()
     stats = stats or scrape.IngestionStats()
+    resolutions = resolutions or ScreenshotResolutions()
+
+    def queue_frame(path):
+        resolutions.add(path)
+
     times.run("Twitch VOD capture", scrape_twitch.capture_category,
-              limit=limit, workers=capture_workers, stats=stats)
+              limit=limit, workers=capture_workers, stats=stats,
+              on_screenshot=queue_frame)
     times.run("Twitch OCR", ocr.main,
               screenshots_dir=scrape_twitch.SCREENSHOT_DIR,
               output_file=scrape_twitch.METADATA_FILE,
@@ -267,9 +339,10 @@ def publish_changes():
     subprocess.run(["git", "push", "origin"], cwd=ROOT, check=True)
 
 
-def main(*, channel_urls=None, channel_workers=2, capture_workers=4,
+def main(*, channel_urls=None, channel_workers=2, capture_workers=8,
          ocr_batch_size=8, ocr_workers=None, rename_requests=300,
-         twitch_limit=25, twitch_full=False, twitch_capture_workers=2,
+         twitch_limit=scrape_twitch.MAX_VIDEO_PAGE, twitch_full=False,
+         twitch_capture_workers=16,
          use_warp=True, use_provider=True, publish=True, cleanup=True,
          verbose=False):
     if min(channel_workers, capture_workers, ocr_batch_size) < 1:
@@ -279,9 +352,9 @@ def main(*, channel_urls=None, channel_workers=2, capture_workers=4,
     if twitch_limit < 0:
         raise ValueError("Twitch VOD limit must not be negative")
     if twitch_full:
-        # Discovery already stops at the 60-day retention cutoff; the GQL
-        # maximum makes the request cover that whole window instead of the
-        # small recent-update cap.
+        # Discovery already stops at the 50-day retention cutoff; the GQL
+        # maximum makes the request cover that whole window. This is also the
+        # default, and the flag remains an explicit override.
         twitch_limit = scrape_twitch.MAX_VIDEO_PAGE
     if twitch_capture_workers < 1:
         raise ValueError("Twitch capture worker count must be positive")
@@ -289,11 +362,16 @@ def main(*, channel_urls=None, channel_workers=2, capture_workers=4,
     started = time.perf_counter()
     times = StageTimes()
     stats = scrape.IngestionStats()
+    youtube_resolutions = ScreenshotResolutions()
+    twitch_resolutions = ScreenshotResolutions()
     sources = CHANNELS if channel_urls is None else channel_urls
+    twitch_label = ("off" if not twitch_limit else
+                    "full 50-day" if twitch_limit >= scrape_twitch.MAX_VIDEO_PAGE
+                    else twitch_limit)
     ui.banner("BAR update", f"{len(sources)} source{'s' if len(sources) != 1 else ''} · "
                             f"{channel_workers} channel workers · "
                             f"{capture_workers} capture workers · OCR batch {ocr_batch_size} · "
-                            f"Twitch VODs {'full 60-day' if twitch_full else (twitch_limit or 'off')} · "
+                            f"Twitch VODs {twitch_label} · "
                             f"WARP {'on' if use_warp else 'off'} · PO provider "
                             f"{'on' if use_provider else 'off'}")
     try:
@@ -305,13 +383,13 @@ def main(*, channel_urls=None, channel_workers=2, capture_workers=4,
                 player_database=updateBattleDB.DB_NAME,
                 channel_workers=channel_workers, capture_workers=capture_workers,
                 ocr_batch_size=ocr_batch_size, times=times, stats=stats,
-                ocr_workers=ocr_workers
+                ocr_workers=ocr_workers, resolutions=youtube_resolutions
             )
             if twitch_limit:
                 run_twitch_ingestion(
                     limit=twitch_limit, capture_workers=twitch_capture_workers,
                     ocr_batch_size=ocr_batch_size, times=times, stats=stats,
-                    ocr_workers=ocr_workers
+                    ocr_workers=ocr_workers, resolutions=twitch_resolutions
                 )
         # A fresh interpreter keeps the matching pool's workers independent of
         # the updater's GPU context and avoids importing its OCR model stack.
@@ -334,15 +412,19 @@ def main(*, channel_urls=None, channel_workers=2, capture_workers=4,
                 directories.append(scrape_twitch.SCREENSHOT_DIR)
             for directory in directories:
                 if Path(directory).exists():
-                    shutil.rmtree(directory)
+                    # shutil.rmtree(directory)
+                    continue
         return times.seconds
     finally:
-        report_summary(stats, times)
+        report_summary(stats, times, screenshot_resolutions={
+            "YouTube": youtube_resolutions.snapshot(),
+            "Twitch": twitch_resolutions.snapshot(),
+        })
         logger.info("Total wall time %s · stage times overlap, so do not add them",
                     ui.duration(time.perf_counter() - started))
 
 
-def report_summary(stats, times):
+def report_summary(stats, times, screenshot_resolutions=None):
     """Print run totals after success or failure, without empty tables."""
     counters, failures = stats.snapshot()
     if counters["sources"]:
@@ -369,6 +451,15 @@ def report_summary(stats, times):
     if times.seconds:
         ui.stats_table("Stages", [(name, ui.duration(seconds))
                                   for name, seconds in times.seconds.items()])
+    if screenshot_resolutions:
+        rows = []
+        for platform, counts in screenshot_resolutions.items():
+            parts = [f"{bucket} {count:,}"
+                     for bucket, count in (counts or {}).items() if count]
+            if parts:
+                rows.append((platform, " · ".join(parts)))
+        if rows:
+            ui.stats_table("Screenshot resolutions", rows)
 
 
 def cli():
@@ -381,10 +472,12 @@ def cli():
                         help="parallel OCR readers (default: 3 on GPU, 1 on CPU)")
     parser.add_argument("--rename-requests", type=int, default=300,
                         help="maximum Gex name lookups per update (0 disables)")
-    parser.add_argument("--twitch-limit", type=int, default=25,
-                        help="recent Twitch category VODs per update (0 disables)")
+    parser.add_argument("--twitch-limit", type=int,
+                        default=scrape_twitch.MAX_VIDEO_PAGE,
+                        help="maximum category-feed VODs per update (0 disables; "
+                             "1000/default: walk the full 50-day window)")
     parser.add_argument("--twitch-full", action="store_true",
-                        help="capture every available VOD in the 60-day retention "
+                        help="capture every available VOD in the 50-day retention "
                              "window (overrides --twitch-limit)")
     parser.add_argument("--twitch-capture-workers", type=int, default=2)
     parser.add_argument("--no-warp", dest="use_warp", action="store_false")

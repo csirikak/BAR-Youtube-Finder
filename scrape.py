@@ -102,11 +102,20 @@ def youtube_client(options):
     with YTDLP_INIT_LOCK:
         return yt_dlp.YoutubeDL(options)
 
+def screenshot_interval(video):
+    """Per-video sampling interval; 12 minutes unless a record overrides it."""
+    interval = video.get('screenshot_interval_sec', INTERVAL_SEC)
+    if (not isinstance(interval, (int, float)) or not math.isfinite(interval)
+            or interval < 1):
+        return INTERVAL_SEC
+    return int(interval)
+
+
 def expected_timestamps(video):
     duration = video.get('duration')
     if not isinstance(duration, (int, float)) or not math.isfinite(duration):
         return []
-    return list(range(START_TIME_SEC, math.floor(duration), INTERVAL_SEC))
+    return list(range(START_TIME_SEC, math.floor(duration), screenshot_interval(video)))
 
 
 def is_complete_png(filename):
@@ -213,6 +222,10 @@ def update_video_database(video_list, db_filepath='screenshot_data.json'):
                 'thumbnail': video.get('thumbnail'),
                 'live_status': video.get('live_status'),
             }
+            if video.get('screenshot_interval_sec'):
+                video_data['screenshot_interval_sec'] = video['screenshot_interval_sec']
+            if video.get('started_at'):
+                video_data['started_at'] = video['started_at']
 
             # Check if it's an addition or update
             if video_id in video_db:

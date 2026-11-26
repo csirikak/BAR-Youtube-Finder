@@ -8,3 +8,9 @@ playerName.py
 players_database.db
 manager.py
 logs/
+
+# Local segmentation dataset work: screenshots, masks, pseudo-labels, reports.
+# Only the trained model and the bbox pipeline belong in the repo.
+yolo_seg_work/
+training_screenshots/
+runs/
